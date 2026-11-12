@@ -276,32 +276,53 @@ function parseEpisodePage(html) {
   };
 }
 
-// series / movie page ka metadata (cheerio); test mode mein output dekhke selectors theek honge
+// body ke flat text se overview / runtime / year / season-episode claims nikaalta hai (pure function)
+function metaFromText(flat, title) {
+  const i = title ? flat.indexOf(title) : -1;
+  const start = i >= 0 ? i + title.length : 0;
+  const oi = flat.indexOf('Overview', start);
+  let overview = '';
+  if (oi >= 0) {
+    const rest = flat.slice(oi + 8);
+    const end = rest.search(/\s(?:Read More|Genres|Languages)\b/);
+    overview = (end >= 0 ? rest.slice(0, end) : rest.slice(0, 1500)).trim();
+  }
+  const near = flat.slice(start, oi >= 0 ? Math.min(oi, start + 300) : start + 300);
+  return {
+    overview,
+    runtime: (near.match(/\b(\d+h\s*\d+m|\d+h|\d+\s*min)\b/) || [])[1] || null,
+    year: (near.match(/\b((?:19|20)\d{2})\b(?!\s*Episodes?)/) || [])[1] || null,
+    claims: {
+      seasons: +((near.match(/(\d+)\s*Seasons?/i) || [])[1] || 0) || null,
+      episodes: +((near.match(/(\d+)\s*Episodes?/i) || [])[1] || 0) || null,
+    },
+  };
+}
+
+// series / movie page ka metadata (cheerio)
 function parseMeta(html) {
   const cheerio = require('cheerio');
   const $ = cheerio.load(html);
   const title = decode($('h1').first().text());
-  let overview = decode($('.overviewCss').first().text());
+  const flat = decode($('body').text());
+  const t = metaFromText(flat, title);
+  let overview = t.overview;
+  if (!overview) overview = decode($('.overviewCss').first().text());
   if (!overview) overview = decode($('meta[property="og:description"]').attr('content') || '');
   overview = overview.replace(/\s*Read More\s*$/i, '');
   const texts = (sel) => uniq($(sel).map((_, e) => decode($(e).text())).get().filter(Boolean));
-  const flat = decode($('body').text());
-  const i = title ? flat.indexOf(title) : -1;
-  const near = i >= 0 ? flat.slice(i + title.length, i + title.length + 300) : '';
   const head = html.split(/Recommended (?:Movies|Series)/)[0];
   return {
     title,
     overview,
     genres: texts('a[href*="/category/genre/"]'),
     languages: texts('a[href*="/category/language/"]'),
-    runtime: (near.match(/\b(\d+h\s*\d+m|\d+h|\d+\s*min)\b/) || [])[1] || null,
-    year: (near.match(/\b(?:19|20)\d{2}\b/) || [])[0] || null,
-    claims: {
-      seasons: +((near.match(/(\d+)\s*Seasons?/i) || [])[1] || 0) || null,
-      episodes: +((near.match(/(\d+)\s*Episodes?/i) || [])[1] || 0) || null,
-    },
+    runtime: t.runtime,
+    year: t.year,
+    claims: t.claims,
     poster: normImg((head.match(/(?:https?:)?\/\/image\.tmdb\.org\/t\/p\/w500\/[^"'\s)]+/) || [])[0]),
-    backdrop: normImg((head.match(/(?:https?:)?\/\/image\.tmdb\.org\/t\/p\/w1280\/[^"'\s)]+/) || [])[0]),
+    // background image page ke aakhir mein hoti hai (Recommended ke baad), isliye poore html mein dhoondho
+    backdrop: normImg((html.match(/(?:https?:)?\/\/image\.tmdb\.org\/t\/p\/w1280\/[^"'\s)]+/) || [])[0]),
   };
 }
 
@@ -385,7 +406,8 @@ async function processMovie(db, t) {
   if (!servers.length) servers = fallbackServers(html);
   const downloads = parseDownloads(html);
   const dl = downloads.find((d) => d.trid);
-  const postId = (dl && dl.trid) || (html.match(/\bterm-(\d+)\b/) || [])[1] || null;
+  const postId = (dl && dl.trid) || (html.match(/\bpostid-(\d+)\b/) || [])[1] || (html.match(/\bterm-(\d+)\b/) || [])[1] ||
+    (html.match(/let postID = "(\d+)"/) || [])[1] || (html.match(/[?&]p=(\d+)['"]/) || [])[1] || null;
   const flags = servers.length ? [] : ['no_servers'];
   await db.collection('titles').updateOne({ _id: t._id }, {
     $set: {
@@ -642,7 +664,7 @@ async function main() {
   }
 }
 
-module.exports = { parseServers, parseDownloads, parseSeasons, parseEpisodeList, parseEpisodePage, classify, epSlugParts, slugOf, decode, fallbackServers };
+module.exports = { metaFromText, parseServers, parseDownloads, parseSeasons, parseEpisodeList, parseEpisodePage, classify, epSlugParts, slugOf, decode, fallbackServers };
 
 if (require.main === module) {
   process.on('unhandledRejection', (e) => log('unhandledRejection', e && e.message));
