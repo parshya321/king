@@ -42,6 +42,18 @@ const uniq = (a) => [...new Set(a)];
 /* HTTP                                                                */
 /* ------------------------------------------------------------------ */
 let _http;
+// EXTRA_HEADERS="X-IA-Key: abc123"  (ek se zyada ho to | se alag karo) - site owner ki permission wala key.
+// Sirf EXTRA_HEADERS_HOST wali site ko bheja jaata hai (jaise watchanimeworld.one), kisi aur ko nahi.
+function extraHeaders(url) {
+  const host = String(process.env.EXTRA_HEADERS_HOST || '').trim().toLowerCase();
+  let u; try { u = new URL(url).hostname.toLowerCase(); } catch (e) { return {}; }
+  if (!host || (u !== host && !u.endsWith('.' + host))) return {};
+  const h = {};
+  String(process.env.EXTRA_HEADERS || '').split('|').forEach((p) => {
+    const i = p.indexOf(':'); if (i > 0) h[p.slice(0, i).trim()] = p.slice(i + 1).trim();
+  });
+  return h;
+}
 function http() {
   if (!_http) {
     const axios = require('axios');
@@ -60,7 +72,7 @@ function http() {
 async function get(url, tries = 4) {
   for (let i = 0; i < tries; i++) {
     try {
-      const r = await http().get(url);
+      const r = await http().get(url, { headers: extraHeaders(url) });
       const body = typeof r.data === 'string' ? r.data : String(r.data);
       if (/<title>\s*Just a moment/i.test(body)) throw Object.assign(new Error('cloudflare_challenge'), { blocked: true });
       await sleep(DELAY_MS + Math.random() * 150);
@@ -171,6 +183,7 @@ const HELP = [
   'Commands:',
   '/status  : kitna data aaya, speed, ETA, errors',
   '/audit   : saboot: site ke total vs hamare DB, kuch chhoota to nahi',
+  '/titles  : hamare saare titles ki list .txt file mein',
   '/errors  : aakhri errors aur kitne kis type ke',
   '/review  : jo titles verify mein fail hue (wajah ke saath)',
   '/new     : site pe naye mile titles / badle links',
@@ -186,6 +199,23 @@ async function handleCommand(db, text, chatId) {
   if (cmd === '/id') return tgSend(`Chat ID: ${chatId}`, chatId);
   if (cmd === '/status') return tgSend(await statusText(db), chatId);
   if (cmd === '/audit') return tgSend(await auditText(db), chatId);
+  if (cmd === '/titles') {
+    // hamare saare titles ki list ek .txt file mein (type | slug | naam | languages)
+    const rows = await T.find({}, { projection: { _id: 1, type: 1, slug: 1, title: 1, languages: 1 } }).toArray();
+    const lines = rows.map((r) => {
+      const [type, slug] = String(r._id).split(':');
+      return [r.type || type, r.slug || slug, r.title || '', (r.languages || []).join(', ')].join(' | ');
+    }).sort();
+    try {
+      const fd = new FormData();
+      fd.append('chat_id', String(chatId));
+      fd.append('caption', `Hamare titles: ${lines.length}`);
+      fd.append('document', new Blob([lines.join('\n')], { type: 'text/plain' }), 'our_titles.txt');
+      const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendDocument`, { method: 'POST', body: fd });
+      if (!r.ok) return tgSend('File bhejne mein dikkat: HTTP ' + r.status, chatId);
+    } catch (e) { return tgSend('File bhejne mein dikkat: ' + e.message, chatId); }
+    return;
+  }
   if (cmd === '/errors') {
     const last = await db.collection('errors').find({}).sort({ ts: -1 }).limit(15).toArray();
     const by = await db.collection('errors').aggregate([{ $match: { ts: { $gte: new Date(Date.now() - 86400000) } } }, { $group: { _id: '$kind', n: { $sum: 1 } } }]).toArray();
