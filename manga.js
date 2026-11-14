@@ -46,6 +46,7 @@ const TG_CHAT = env('TG_CHAT_ID', '');
 const ADULT = new Set(String(env('ADULT_GENRES', 'Mature,Sexual Violence,Smut,Hentai,Adult')).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
 const UA = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36';
 
+const PV = 2; // parser version: badla to purane manga dobara padhe jayenge
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const fmtN = (n) => Number(n || 0).toLocaleString('en-IN');
@@ -59,7 +60,18 @@ const http = axios.create({
   transformResponse: (d) => d,
   validateStatus: (s) => s >= 200 && s < 300,
 });
-const stats = { req: 0, errors: 0, errLog: [], newManga: 0, newChapters: 0, started: Date.now(), lastSync: 0 };
+const stats = {
+  req: 0, errors: 0, errLog: [], newManga: 0, newChapters: 0, started: Date.now(), lastSync: 0,
+  phase: 'starting', siteCount: 0, jobsTotal: 0, jobsDone: 0, jobsStarted: 0, walkTotal: 0, walkDone: 0,
+  newList: [], // naye manga / chapters ke naam, notification ke liye
+};
+const fmtDur = (ms) => {
+  const min = ms / 60000;
+  if (!isFinite(min) || min < 0) return '-';
+  if (min < 60) return `${Math.round(min)} min`;
+  const h = Math.floor(min / 60);
+  return h < 48 ? `${h}h ${Math.round(min % 60)}m` : `${Math.round(h / 24)} days`;
+};
 
 async function get(url, tries = 4) {
   for (let i = 0; i < tries; i++) {
@@ -164,11 +176,17 @@ function parseManga(html, slug) {
   let title = clean($('h1').first().text()) || clean(meta('og:title'));
   title = title.replace(/\s*[-|–]\s*(read|manga\s*park).*$/i, '').replace(/^read\s+/i, '').trim();
   const body = clean($('body').text());
-  const inChrome = (a) => $(a).closest('header,nav,footer,aside,[class*="menu"],[class*="nav"],[class*="dropdown"]').length > 0;
+  const inChrome = (a) => $(a).closest('header,nav,footer').length > 0;
   const genres = [...new Set($('a[href*="/genre/"]').filter((i, a) => !inChrome(a)).map((i, a) => clean($(a).text())).get().filter(Boolean))];
   const authors = [...new Set($('a[href*="/author/"]').filter((i, a) => !inChrome(a)).map((i, a) => clean($(a).text())).get().filter(Boolean))];
   const type = field(body, 'Type', '(Manga|Manhwa|Manhua|Webtoon|Comic|Doujinshi|One[- ]?shot|Novel)');
-  const status = field(body, 'Status', '(Ongoing|Completed|Hiatus|Cancelled|Discontinued|On Hold)');
+  const desc = clean(meta('og:description') || meta('description'));
+  const dm = /\bis an?\s+(completed|ongoing|hiatus|cancelled|discontinued)\b/i.exec(desc);
+  const status = field(body, '(?:Status|Original Publication|Publication)', '(Ongoing|Completed|Hiatus|Cancelled|Discontinued|On Hold)')
+    || (dm ? dm[1].charAt(0).toUpperCase() + dm[1].slice(1).toLowerCase() : null);
+  if (!authors.length) { const am = /\bby\s+([^,.]+?)(?:,|\.|\s+tagged)/i.exec(desc); if (am) authors.push(clean(am[1])); }
+  let gl = genres.length > 40 ? [] : genres;
+  if (!gl.length) { const tm = /\btagged\s+([^.]+)\./i.exec(desc); if (tm) gl = tm[1].split(/,|\band\b/).map(clean).filter(Boolean); }
   const year = field(body, '(?:Published|Released|Year)', '(\\d{4})');
   const enCount = (new RegExp(LANG_NAME + '\\s*\\((\\d[\\d,]*)\\s*Chapters?\\)', 'i').exec(body) || [])[1];
   let cover = meta('og:image');
@@ -177,8 +195,8 @@ function parseManga(html, slug) {
   return {
     title: title || slug,
     cover: cover ? new URL(cover, BASE).href : null,
-    description: clean(meta('og:description') || meta('description')).slice(0, 2000),
-    genres: genres.length > 40 ? [] : genres, // 40+ matlab menu pakda gaya, galat
+    description: desc.slice(0, 2000),
+    genres: gl, // 40+ matlab menu pakda gaya, galat
     genresSuspicious: genres.length > 40,
     authors,
     type: type ? type.replace(/one[- ]?shot/i, 'Oneshot') : null,
@@ -236,7 +254,8 @@ async function saveManga(slug, info, lastmod) {
     type: info.type, status: info.status, year: info.year, enCount: info.enCount,
     adult: genresLc.some((g) => ADULT.has(g)), doujinshi: genresLc.includes('doujinshi') || /doujin/i.test(info.type || ''),
     chapterCount: after, hasLang: after > 0 || (info.enCount || 0) > 0,
-    live: after > 0, siteLastmod: lastmod || null, scrapedAt: now,
+    live: after > 0, siteLastmod: lastmod || null, scrapedAt: now, pv: PV,
+    listedLast: info.chapters.length ? info.chapters[info.chapters.length - 1].key : null,
     state: needWalk ? 'walk' : 'done',
   };
   if (added > 0) set.updatedAt = now;
@@ -250,8 +269,9 @@ async function doManga(slug, lastmod, isNew) {
     const html = await get(`${BASE}/manga/${enc(slug)}`);
     const info = parseManga(html, slug);
     const r = await saveManga(slug, info, lastmod);
-    if (isNew && r.total > 0) stats.newManga++;
-    else if (!isNew) stats.newChapters += r.added;
+    if (isNew && r.total > 0) { stats.newManga++; stats.newList.push(`📖 ${info.title} (new, ${r.total} chapters)`); }
+    else if (!isNew && r.added > 0) { stats.newChapters += r.added; stats.newList.push(`➕ ${info.title}: ${r.added} new chapter${r.added === 1 ? '' : 's'}`); }
+    if (stats.newList.length > 200) stats.newList.shift();
     if (r.needWalk) await walk(slug);
     return { info, ...r };
   } catch (e) {
@@ -264,22 +284,23 @@ async function doManga(slug, lastmod, isNew) {
 
 /* adhoori list: sabse purane chapter se "Prev Chapter" pakad ke peeche jao */
 async function walk(slug) {
-  const m = await M.findOne({ _id: slug }, { projection: { enCount: 1 } });
+  const m = await M.findOne({ _id: slug }, { projection: { enCount: 1, walkFrom: 1, listedLast: 1 } });
+  let cur = (m && (m.walkFrom || m.listedLast)) || null;
   let steps = 0;
-  for (;;) {
-    const oldest = await C.find({ slug, num: { $ne: null } }).sort({ num: 1 }).limit(1).next()
-      || await C.find({ slug }).sort({ firstSeen: 1 }).limit(1).next();
-    if (!oldest || steps++ > MAX_WALK) break;
+  while (cur && steps++ < MAX_WALK) {
     let nav;
-    try { nav = parseChapterNav(await get(`${BASE}/read/${enc(slug)}/${LANG}/${enc(oldest.key)}`), slug, oldest.key); }
-    catch (e) { noteError('walk', `${slug}/${oldest.key}`, e); break; }
-    if (!nav.prev) break;
+    try { nav = parseChapterNav(await get(`${BASE}/read/${enc(slug)}/${LANG}/${enc(cur)}`), slug, cur); }
+    catch (e) { noteError('walk', `${slug}/${cur}`, e); break; }
+    if (!nav.prev) { cur = null; break; }
     const id = `${slug}|${nav.prev.key}`;
-    if (await C.findOne({ _id: id }, { projection: { _id: 1 } })) break; // pehle se hai: aage gap nahi
+    if (await C.findOne({ _id: id }, { projection: { _id: 1 } })) { cur = null; break; } // yahan se aage sab pehle se hai
     await C.insertOne({ _id: id, slug, key: nav.prev.key, num: chapNum(nav.prev.key, nav.prev.text), title: 'Chapter ' + (chapNum(nav.prev.key) ?? ''), firstSeen: new Date() });
+    cur = nav.prev.key;
+    if (steps % 20 === 0) await M.updateOne({ _id: slug }, { $set: { walkFrom: cur } }); // restart pe yahin se
   }
+  await M.updateOne({ _id: slug }, cur ? { $set: { walkFrom: cur } } : { $unset: { walkFrom: '' } });
   const total = await C.countDocuments({ slug });
-  const done = !m || m.enCount == null || total >= m.enCount;
+  const done = !cur || !m || m.enCount == null || total >= m.enCount; // peeche tak pahunch gaye = poora
   await M.updateOne({ _id: slug }, { $set: { chapterCount: total, live: total > 0, state: done ? 'done' : 'partial' } });
   return total;
 }
@@ -291,48 +312,89 @@ async function sync(first) {
   try {
     const { maps, list } = await sitemapManga();
     log(`sitemap: ${maps} files, ${list.length} manga`);
-    const known = new Map((await M.find({}, { projection: { siteLastmod: 1, state: 1 } }).toArray()).map((d) => [d._id, d]));
+    const known = new Map((await M.find({}, { projection: { siteLastmod: 1, state: 1, pv: 1 } }).toArray()).map((d) => [d._id, d]));
     const jobs = [];
     for (const { slug, lastmod } of list) {
       const k = known.get(slug);
       if (!k) jobs.push({ slug, lastmod, isNew: !first });
       else if (k.state !== 'done' && k.state !== 'gone') jobs.push({ slug, lastmod, isNew: false });
+      else if (k.state === 'done' && k.pv !== PV) jobs.push({ slug, lastmod, isNew: false });
       else if (lastmod && k.siteLastmod !== lastmod) jobs.push({ slug, lastmod, isNew: false });
     }
     log(`kaam: ${jobs.length} manga`);
-    if (first) await tg(`📚 Manga worker: sitemap mein ${fmtN(list.length)} manga mile. Abhi ${fmtN(jobs.length)} scrape honge.`);
+    stats.siteCount = list.length;
+    if (first) {
+      await tg([
+        '📚 MANGA | SYNC STARTED',
+        `Source: MangaPark (${LANG_NAME} chapters only)`,
+        `Titles on site: ${fmtN(list.length)} (from ${maps} sitemap files)`,
+        `Already up to date: ${fmtN(list.length - jobs.length)}`,
+        `To process now: ${fmtN(jobs.length)}`,
+        '',
+        `Progress reports every ${REPORT_MINUTES} min. Send /manga anytime for a live report.`,
+      ].join('\n'));
+    }
+    stats.phase = 'titles'; stats.jobsTotal = jobs.length; stats.jobsDone = 0; stats.jobsStarted = Date.now();
     const lim = pLimit(CONC_TITLES);
-    await Promise.all(jobs.map((j) => lim(() => doManga(j.slug, j.lastmod, j.isNew))));
+    await Promise.all(jobs.map((j) => lim(() => doManga(j.slug, j.lastmod, j.isNew).finally(() => { stats.jobsDone++; }))));
+    stats.phase = 'chapters';
     // 'partial' wale dobara walk
     const partial = await M.find({ state: { $in: ['walk', 'partial'] } }, { projection: { _id: 1 } }).toArray();
+    stats.walkTotal = partial.length; stats.walkDone = 0;
     const wl = pLimit(CONC_WALK);
-    await Promise.all(partial.map((p) => wl(() => walk(p._id).catch((e) => noteError('walk', p._id, e)))));
+    await Promise.all(partial.map((p) => wl(() => walk(p._id).catch((e) => noteError('walk', p._id, e)).finally(() => { stats.walkDone++; }))));
+    stats.phase = 'idle';
     stats.lastSync = Date.now();
   } catch (e) { noteError('sync', '-', e); }
   finally { syncing = false; }
 }
 
 async function statusText() {
-  const [total, live, done, todo, part, err, gone, noLang, adult, dj, chaps] = await Promise.all([
+  if (!M) throw new Error('not started yet');
+  const [total, live, done, todo, part, err, gone, noLang, adult, dj, chaps, types] = await Promise.all([
     M.countDocuments({}), M.countDocuments({ live: true }), M.countDocuments({ state: 'done' }),
     M.countDocuments({ state: { $in: ['walk', null] } }), M.countDocuments({ state: 'partial' }),
     M.countDocuments({ state: 'error' }), M.countDocuments({ state: 'gone' }),
     M.countDocuments({ state: 'done', live: false }), M.countDocuments({ adult: true, live: true }),
     M.countDocuments({ doujinshi: true, live: true }), C.estimatedDocumentCount(),
+    M.aggregate([{ $match: { live: true } }, { $group: { _id: '$type', n: { $sum: 1 } } }, { $sort: { n: -1 } }]).toArray(),
   ]);
   const hr = Date.now() - 3600e3;
   const errs = stats.errLog.filter((e) => e.at > hr);
+  const PH = { starting: 'Starting', titles: 'Scraping titles', chapters: 'Completing chapter lists', idle: 'Idle (watching for new chapters)' };
+  let progress = '';
+  if (stats.phase === 'titles' && stats.jobsTotal) {
+    const pct = (stats.jobsDone / stats.jobsTotal) * 100;
+    const el = Date.now() - stats.jobsStarted;
+    const eta = stats.jobsDone ? fmtDur((el / stats.jobsDone) * (stats.jobsTotal - stats.jobsDone)) : '-';
+    progress = `• Progress: ${fmtN(stats.jobsDone)} of ${fmtN(stats.jobsTotal)} (${pct.toFixed(1)}%) | ETA: ${eta}`;
+  } else if (stats.phase === 'chapters' && stats.walkTotal) {
+    progress = `• Long chapter lists: ${fmtN(stats.walkDone)} of ${fmtN(stats.walkTotal)} done`;
+  }
+  const typeLine = types.filter((t) => t._id).map((t) => `${t._id} ${fmtN(t.n)}`).join(' | ');
   return [
-    '📚 MANGA STATUS',
-    `Manga DB mein: ${fmtN(total)} | Live (${LANG_NAME} chapters wale): ${fmtN(live)}`,
-    `Done: ${fmtN(done)} | Adhoori list: ${fmtN(part)} | Error: ${fmtN(err)} | Site se hata: ${fmtN(gone)}`,
-    `${LANG_NAME} chapter nahi: ${fmtN(noLang)} | 18+: ${fmtN(adult)} | Doujinshi: ${fmtN(dj)}`,
-    `Chapters: ${fmtN(chaps)}`,
-    `Naye (is run mein): manga ${fmtN(stats.newManga)} | chapters ${fmtN(stats.newChapters)}`,
-    `Requests: ${fmtN(stats.req)} | Errors pichhle 1 ghante: ${errs.length}`,
-    ...(errs.slice(-5).map((e) => '  • ' + e.msg)),
-    `Last sync: ${stats.lastSync ? Math.round((Date.now() - stats.lastSync) / 60000) + ' min pehle' : 'chal raha hai'}`,
-    `Baaki kaam: ${fmtN(todo)}`,
+    '📚 MANGA CATALOG | STATUS REPORT',
+    `Source: MangaPark (${LANG_NAME})`,
+    `Phase: ${PH[stats.phase] || stats.phase}`,
+    `Uptime: ${fmtDur(Date.now() - stats.started)}`,
+    ...(progress ? [progress] : []),
+    '',
+    '📖 TITLES',
+    `• On site: ${fmtN(stats.siteCount || total)} | In database: ${fmtN(total)}`,
+    `• Live in Mini App: ${fmtN(live)}`,
+    `• Complete: ${fmtN(done)} | Queued: ${fmtN(todo)} | Chapter list in progress: ${fmtN(part)}`,
+    `• Errors: ${fmtN(err)} | Removed from site: ${fmtN(gone)} | No ${LANG_NAME} chapters: ${fmtN(noLang)}`,
+    `• 18+: ${fmtN(adult)} | Doujinshi: ${fmtN(dj)}`,
+    ...(typeLine ? [`• By type: ${typeLine}`] : []),
+    '',
+    '📄 CHAPTERS',
+    `• Total in database: ${fmtN(chaps)}`,
+    `• New since start: ${fmtN(stats.newManga)} titles | ${fmtN(stats.newChapters)} chapters`,
+    '',
+    '🩺 HEALTH',
+    `• Requests sent: ${fmtN(stats.req)} | Errors in the last hour: ${errs.length}`,
+    ...(errs.slice(-5).map((e) => '   - ' + e.msg)),
+    `• Last full sync: ${stats.lastSync ? fmtDur(Date.now() - stats.lastSync) + ' ago' : 'in progress'}`,
   ].join('\n');
 }
 
@@ -348,20 +410,26 @@ async function testMode() {
       const last = info.chapters[info.chapters.length - 1];
       if (last) nav = parseChapterNav(await get(`${BASE}/read/${enc(slug)}/${LANG}/${enc(last.key)}`), slug, last.key);
       out = [
-        `🧪 TEST: ${slug}`,
-        `Naam: ${info.title}`,
-        `Type: ${info.type} | Status: ${info.status} | Saal: ${info.year}`,
+        `🧪 MANGA | TEST REPORT`,
+        `Slug: ${slug}`,
+        '',
+        `Title: ${info.title}`,
+        `Type: ${info.type || '-'} | Status: ${info.status || '-'} | Year: ${info.year || '-'}`,
         `Author: ${info.authors.join(', ') || '-'}`,
-        `Genres (${info.genres.length})${info.genresSuspicious ? ' ⚠️ menu pakda gaya' : ''}: ${info.genres.join(', ') || '-'}`,
-        `18+: ${info.genres.some((g) => ADULT.has(g.toLowerCase())) ? 'haan' : 'nahi'}`,
+        `Genres (${info.genres.length})${info.genresSuspicious ? ' ⚠️ site menu detected, ignored' : ''}: ${info.genres.join(', ') || '-'}`,
+        `18+: ${info.genres.some((g) => ADULT.has(g.toLowerCase())) ? 'Yes' : 'No'}`,
         `Cover: ${info.cover || '-'}`,
-        `Description: ${(info.description || '-').slice(0, 150)}`,
-        `${LANG_NAME} chapters (site ke hisaab se): ${info.enCount ?? '?'} | page pe mile: ${info.chapters.length}`,
-        `Pehla/aakhri mila: ${sorted[0] ? sorted[0].key : '-'} ... ${sorted.length ? sorted[sorted.length - 1].key : '-'}`,
-        `Sabse purane chapter ka "Prev": ${nav && nav.prev ? nav.prev.key : 'nahi mila'} | uske pages: ${nav ? nav.pages : '-'}`,
-        info.enCount && info.chapters.length < info.enCount ? '➡️ List adhoori hai, run mode mein Prev se peeche jayega.' : '✅ List poori hai.',
+        `Description: ${(info.description || '-').slice(0, 200)}`,
+        '',
+        `${LANG_NAME} chapters on site: ${info.enCount ?? 'unknown'}`,
+        `Chapters listed on the page: ${info.chapters.length}`,
+        `Range found: ${sorted[0] ? sorted[0].key : '-'} to ${sorted.length ? sorted[sorted.length - 1].key : '-'}`,
+        `Previous chapter link from the oldest listed chapter: ${nav && nav.prev ? nav.prev.key : 'not found'} (${nav && nav.pages ? nav.pages + ' pages' : 'page count unknown'})`,
+        info.enCount && info.chapters.length < info.enCount
+          ? `➡️ The page lists only part of the chapters. In run mode the worker follows "Previous chapter" links to collect the remaining ${info.enCount - info.chapters.length}.`
+          : '✅ Full chapter list found on the page.',
       ].join('\n');
-    } catch (e) { out = `🧪 TEST: ${slug}\n❌ ${e.message}`; }
+    } catch (e) { out = `🧪 MANGA | TEST REPORT\nSlug: ${slug}\n❌ Failed: ${e.message}`; }
     log('\n' + out);
     await tg(out);
   }
@@ -370,34 +438,42 @@ async function testMode() {
 async function main() {
   if (MODE === 'count') {
     const { maps, list } = await sitemapManga();
-    const msg = `📚 MangaPark sitemap: ${maps} files, ${fmtN(list.length)} manga`;
+    const msg = `📚 MANGA | SITE COUNT\nMangaPark sitemap: ${fmtN(list.length)} titles in ${maps} files`;
     log(msg); await tg(msg); return;
   }
   if (MODE === 'test') { await testMode(); return; }
-  if (!MONGO_URI) throw new Error('MONGO_URI nahi diya');
+  if (!MONGO_URI) throw new Error('MONGO_URI is not set');
   await initDb();
-  await tg('📚 Manga worker chalu hua.');
-  setInterval(async () => { try { await tg(await statusText()); } catch (e) { log('report', e.message); } }, REPORT_MINUTES * 60e3);
+  await tg(`🚀 Manga worker started (database: ${DB_NAME}, source: MangaPark, language: ${LANG_NAME}).`);
+  // idle mein report nahi (sirf naya content aane pe message); /manga se kabhi bhi
+  setInterval(async () => { if (stats.phase === 'idle') return; try { await tg(await statusText()); } catch (e) { log('report', e.message); } }, REPORT_MINUTES * 60e3);
   await sync(true);
-  await tg('✅ Pehla manga sync poora.\n\n' + await statusText());
-  stats.newManga = 0; stats.newChapters = 0;
+  await tg('✅ MANGA | FULL SYNC COMPLETE\n\n' + await statusText());
+  stats.newManga = 0; stats.newChapters = 0; stats.newList = [];
   for (;;) {
     await sleep(WATCH_MINUTES * 60e3);
-    const a = stats.newManga, b = stats.newChapters;
+    const a = stats.newManga, b = stats.newChapters, k = stats.newList.length;
     await sync(false);
     if (stats.newManga > a || stats.newChapters > b) {
-      await tg(`🆕 Naya manga content: ${stats.newManga - a} manga, ${stats.newChapters - b} chapters`);
+      const items = stats.newList.slice(k);
+      await tg([
+        '🆕 MANGA | NEW CONTENT',
+        `New titles: ${stats.newManga - a} | New chapters: ${stats.newChapters - b}`,
+        '',
+        ...items.slice(0, 25),
+        ...(items.length > 25 ? [`...and ${items.length - 25} more`] : []),
+      ].join('\n'));
     }
   }
 }
 
 if (require.main === module) {
   main().then(() => { if (MODE !== 'run') process.exit(0); }).catch(async (e) => {
-    log('FATAL', e); await tg('❌ Manga worker band: ' + e.message); process.exit(1);
+    log('FATAL', e); await tg('❌ Manga worker stopped: ' + e.message); process.exit(1);
   });
 }
 // index.js ke andar se chalane ke liye: error aaye to bhi animesalt scraper band nahi hota
 function start() {
-  main().catch(async (e) => { log('MANGA FATAL', e && e.message); await tg('❌ Manga worker ruk gaya: ' + (e && e.message)); });
+  main().catch(async (e) => { log('MANGA FATAL', e && e.message); await tg('❌ Manga worker stopped: ' + (e && e.message) + '\nThe anime scraper keeps running.'); });
 }
-module.exports = { start, parseManga, parseChapterNav, locs, slugOf, chapNum };
+module.exports = { start, statusText, parseManga, parseChapterNav, locs, slugOf, chapNum };
