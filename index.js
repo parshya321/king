@@ -9,6 +9,7 @@
  *   verify : sirf verification chalata hai
  *   reconcile : site ki apni list se exact total nikaalke sitemap se compare karta hai, chhoote titles queue mein daalta hai
  *   retry  : fail hue episodes dobara queue mein daalta hai
+ *   probe  : PROBE_URLS ke pages download karke Telegram bot pe .html file bhejta hai
  *
  * Mismatch rokne ke rules:
  *   - Har cheez ka ID URL slug hai (naam nahi). Episode ID = "naruto-shippuden-2x37".
@@ -28,6 +29,8 @@ const C_EPS = +process.env.CONCURRENCY_EPISODES || 6;
 const DELAY_MS = +process.env.DELAY_MS || 300;
 const WATCH_MIN = +process.env.WATCH_MINUTES || 10;
 const MAX_ATTEMPTS = 3;
+const RETRY_HOURS = +process.env.RETRY_HOURS || 6;
+const DEEP_HOURS = +process.env.DEEP_HOURS || 24;
 const UA = process.env.USER_AGENT ||
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
@@ -141,7 +144,7 @@ async function statusText(db) {
     E.countDocuments({ scraped: false, attempts: { $lt: MAX_ATTEMPTS } }), E.countDocuments({ scraped: false, attempts: { $gte: MAX_ATTEMPTS } }),
     E.countDocuments({ flags: 'no_servers' }), E.countDocuments({ scraped_at: { $gte: since10 } }),
     db.collection('errors').countDocuments({ ts: { $gte: since1h } }),
-    T.countDocuments({ type: 'series', status: 'error', error: 'no_episode_link' }),
+    T.countDocuments({ type: 'series', no_episodes: true }),
   ]);
   const perMin = last10 / 10;
   const eta = perMin > 0 ? fmtDur(epend / perMin) : (epend ? 'speed 0, ruka hua?' : '-');
@@ -151,7 +154,7 @@ async function statusText(db) {
     `⏱ Chal raha: ${fmtDur((Date.now() - stats.startedAt) / 60000)}`,
     ``,
     `🎬 Site ke titles mile: Series ${fmtN(ts)} | Movies ${fmtN(tm)} | hidden ${hidden}`,
-    `✅ Titles complete: ${fmtN(done)} | baaki: ${fmtN(pend)} | error: ${terr}${noEpTitles ? ` (bina episode link: ${noEpTitles})` : ''}`,
+    `✅ Titles complete: ${fmtN(done)} | baaki: ${fmtN(pend)} | error: ${terr}${noEpTitles ? ` | bina episodes abhi: ${noEpTitles}` : ''}`,
     `🟢 Live (Mini App ke liye ready): ${fmtN(live)} | 🔴 review chahiye: ${fmtN(review)}`,
     ``,
     `📺 Episodes: mile ${fmtN(etot)} | scrape hue ${fmtN(edone)} | baaki ${fmtN(epend)} | fail ${fmtN(efail)} | bina server ${fmtN(nosrv)}`,
@@ -167,6 +170,7 @@ async function statusText(db) {
 const HELP = [
   'Commands:',
   '/status  : kitna data aaya, speed, ETA, errors',
+  '/audit   : saboot: site ke total vs hamare DB, kuch chhoota to nahi',
   '/errors  : aakhri errors aur kitne kis type ke',
   '/review  : jo titles verify mein fail hue (wajah ke saath)',
   '/new     : site pe naye mile titles / badle links',
@@ -181,6 +185,7 @@ async function handleCommand(db, text, chatId) {
   if (cmd === '/start' || cmd === '/help') return tgSend(HELP, chatId);
   if (cmd === '/id') return tgSend(`Chat ID: ${chatId}`, chatId);
   if (cmd === '/status') return tgSend(await statusText(db), chatId);
+  if (cmd === '/audit') return tgSend(await auditText(db), chatId);
   if (cmd === '/errors') {
     const last = await db.collection('errors').find({}).sort({ ts: -1 }).limit(15).toArray();
     const by = await db.collection('errors').aggregate([{ $match: { ts: { $gte: new Date(Date.now() - 86400000) } } }, { $group: { _id: '$kind', n: { $sum: 1 } } }]).toArray();
@@ -529,7 +534,16 @@ async function processSeries(db, t) {
   await harvest(db, html);
   const meta = parseMeta(html);
   const first = (html.match(/href="(https?:\/\/[^"]*\/episode\/[^"]+)"/) || [])[1];
-  if (!first) throw new Error('no_episode_link');
+  if (!first) { // abhi episodes nahi (upcoming?) : title phir bhi DB mein save, roz dobara check hoga
+    await db.collection('titles').updateOne({ _id: t._id }, { $set: {
+      title: meta.title, overview: meta.overview, genres: meta.genres, languages: meta.languages,
+      runtime: meta.runtime, year: meta.year, claims: meta.claims, poster: meta.poster, backdrop: meta.backdrop,
+      seasons: [], episodes_listed: 0, no_episodes: true, status: 'done', needs_refresh: false,
+      error: null, attempts: 0, scraped_at: new Date(),
+    } });
+    log(`series ok (abhi episodes nahi): ${t.slug}`);
+    return;
+  }
 
   const epHtml = await get(first);
   const cur = parseEpisodePage(epHtml);
@@ -587,7 +601,7 @@ async function processSeries(db, t) {
       runtime: meta.runtime, year: meta.year, claims: meta.claims,
       poster: cur.poster || meta.poster, backdrop: cur.backdrop || meta.backdrop,
       post_id: cur.seriesPost ? +cur.seriesPost : null,
-      seasons, episodes_listed: total,
+      seasons, episodes_listed: total, no_episodes: total === 0,
       status: t.status === 'done' ? 'done' : 'listed',
       needs_refresh: false, error: null, attempts: 0, scraped_at: new Date(),
     },
@@ -621,9 +635,13 @@ async function processTitles(db) {
   const pLimit = require('p-limit');
   const limit = pLimit(C_TITLES);
   const col = db.collection('titles');
+  const cool = new Date(Date.now() - RETRY_HOURS * 3600 * 1000);
   const todo = await col.find({
-    hidden: { $ne: true }, attempts: { $lt: MAX_ATTEMPTS },
-    $or: [{ status: 'pending' }, { status: 'error' }, { needs_refresh: true }],
+    hidden: { $ne: true },
+    $or: [
+      { attempts: { $lt: MAX_ATTEMPTS }, $or: [{ status: 'pending' }, { status: 'error' }, { needs_refresh: true }] },
+      { status: 'error', attempts: { $gte: MAX_ATTEMPTS }, last_try: { $lt: cool } }, // haar nahi maanta: har RETRY_HOURS ghante dobara
+    ],
   }).toArray();
   log(`titles to process: ${todo.length}`);
   let done = 0;
@@ -632,7 +650,7 @@ async function processTitles(db) {
       if (t.type === 'series') await processSeries(db, t); else await processMovie(db, t);
     } catch (e) {
       await col.updateOne({ _id: t._id }, {
-        $set: { error: String(e.message || e).slice(0, 300), ...(t.status === 'done' ? {} : { status: 'error' }) },
+        $set: { error: String(e.message || e).slice(0, 300), last_try: new Date(), ...(t.status === 'done' ? {} : { status: 'error' }) },
         $inc: { attempts: 1 },
       });
       log('ERR title', t.slug, e.message);
@@ -663,7 +681,7 @@ async function processEpisode(db, ep) {
       },
     });
   } catch (e) {
-    await col.updateOne({ _id: ep._id }, { $inc: { attempts: 1 }, $set: { last_error: String(e.message || e).slice(0, 200) } });
+    await col.updateOne({ _id: ep._id }, { $inc: { attempts: 1 }, $set: { last_error: String(e.message || e).slice(0, 200), last_try: new Date() } });
     log('ERR episode', ep._id, e.message);
     await logError(db, 'episode', ep._id, e.message);
   }
@@ -675,7 +693,11 @@ async function processEpisodes(db) {
   const col = db.collection('episodes');
   let total = 0;
   for (;;) {
-    const batch = await col.find({ scraped: false, attempts: { $lt: MAX_ATTEMPTS } }).limit(300).toArray();
+    const cool = new Date(Date.now() - RETRY_HOURS * 3600 * 1000);
+    const batch = await col.find({ scraped: false, $or: [
+      { attempts: { $lt: MAX_ATTEMPTS } },
+      { attempts: { $gte: MAX_ATTEMPTS }, last_try: { $lt: cool } },
+    ] }).limit(300).toArray();
     if (!batch.length) break;
     await Promise.all(batch.map((ep) => limit(() => processEpisode(db, ep))));
     total += batch.length;
@@ -686,7 +708,7 @@ async function processEpisodes(db) {
 
 async function finalize(db) {
   const pend = await db.collection('episodes').aggregate([
-    { $match: { scraped: false, attempts: { $lt: MAX_ATTEMPTS } } },
+    { $match: { scraped: false } },
     { $group: { _id: '$series_slug' } },
   ]).toArray();
   await db.collection('titles').updateMany(
@@ -872,6 +894,7 @@ async function reconcile(found) {
   const sitemapSet = new Set(found.map((f) => `${f.type}:${f.slug}`));
   const site = new Map();
   const lines = [];
+  const totals = {};
   for (const kind of ['series', 'movies']) {
     let r, source = 'rest';
     try { r = await restList(kind); } catch (e) {
@@ -881,6 +904,7 @@ async function reconcile(found) {
     }
     const type = kind === 'series' ? 'series' : 'movie';
     for (const i of r.items) site.set(`${type}:${i.slug}`, { type, slug: i.slug, url: i.url, lastmod: i.lastmod || null });
+    totals[type] = r.total != null ? r.total : r.items.length;
     const inSm = [...sitemapSet].filter((k) => k.startsWith(type + ':')).length;
     const lost = r.items.filter((i) => !sitemapSet.has(`${type}:${i.slug}`)).length;
     lines.push(`${kind.toUpperCase()}: site ka exact total ${r.total != null ? r.total : r.items.length} (via ${source}) | sitemap ${inSm} | sitemap mein nahi ${lost}`);
@@ -895,6 +919,8 @@ async function reconcile(found) {
   const extras = [...site.entries()].filter(([k]) => !sitemapSet.has(k)).map(([, v]) => v);
   const union = new Set([...sitemapSet, ...site.keys()]);
   lines.push(`TOTAL (sab sources milake): ${union.size} titles | sitemap se alag mile: ${extras.length}`);
+  stats.siteTotals = totals;
+  stats.siteKeys = [...union];
   lines.forEach((l) => log('DISCOVERY ' + l));
   stats.lastDeep = { at: new Date(), lines };
   await tgSend('🔎 Deep discovery\n' + lines.join('\n') + (extras.length ? `\nChhoote hue (pehle 10): ${extras.slice(0, 10).map((e) => e.slug).join(', ')}` : ''));
@@ -915,8 +941,9 @@ let lastReconcile = 0;
 async function runOnce(db, watch) {
   stats.phase = 'discovery';
   const found = await discover(!watch);
-  if (!watch || stats.forceDeep || Date.now() - lastReconcile > 24 * 3600 * 1000) {
+  if (!watch || stats.forceDeep || Date.now() - lastReconcile > DEEP_HOURS * 3600 * 1000) {
     stats.forceDeep = false;
+    try { await maintenance(db); } catch (e) { log('maintenance error:', e.message); }
     try { found.push(...(await reconcile(found))); lastReconcile = Date.now(); } catch (e) { log('reconcile error:', e.message); await logError(db, 'discovery', 'reconcile', e.message); }
   }
   const r = await syncTitles(db, found);
@@ -937,6 +964,46 @@ async function runOnce(db, watch) {
   } else if (watch && (r.added || r.changed)) {
     await tgSend(`🆕 Anime Salt sync: ${r.added} naye, ${r.changed} badle.\n${r.newTitles.slice(0, 15).join(', ')}`);
   }
+}
+
+// roz ek baar: jo kuch adhoora ya shak wala dikha use dobara check karne ke liye queue karo
+async function maintenance(db) {
+  const E = db.collection('episodes'), T = db.collection('titles');
+  const dayAgo = new Date(Date.now() - 24 * 3600 * 1000);
+  const a = await E.updateMany({ flags: 'no_servers', scraped_at: { $lt: dayAgo } }, { $set: { scraped: false, attempts: 0 } });
+  const b = await T.updateMany(
+    { status: 'done', live: false, hidden: { $ne: true }, errors: { $regex: /^(zero_episodes|season_count|duplicate|unscraped)/ } },
+    { $set: { needs_refresh: true, attempts: 0 } });
+  log(`maintenance: ${a.modifiedCount} no_server episodes, ${b.modifiedCount} adhoore titles dobara queue mein`);
+}
+
+async function auditText(db) {
+  const T = db.collection('titles'), E = db.collection('episodes');
+  const out = ['🧾 AUDIT: kuch chhoota to nahi?'];
+  const tot = stats.siteTotals;
+  for (const type of ['series', 'movie']) {
+    const have = await T.countDocuments({ type, hidden: { $ne: true } });
+    const site = tot ? tot[type] : null;
+    out.push(`${type === 'series' ? 'Series' : 'Movies'}: site ${site != null ? site : '? (/discover chalao)'} | hamare DB mein ${have} ${site != null ? (have >= site ? '✅' : `❌ ${site - have} kam`) : ''}`);
+  }
+  if (stats.siteKeys) {
+    let missing = 0; const sample = [];
+    for (let i = 0; i < stats.siteKeys.length; i += 1000) {
+      const chunk = stats.siteKeys.slice(i, i + 1000);
+      const have = new Set((await T.find({ _id: { $in: chunk } }, { projection: { _id: 1 } }).toArray()).map((d) => d._id));
+      for (const k of chunk) if (!have.has(k)) { missing++; if (sample.length < 10) sample.push(k); }
+    }
+    out.push(`Site ki list ke ${stats.siteKeys.length} titles mein se DB mein nahi: ${missing}${missing ? '\n  ' + sample.join(', ') : ' ✅'}`);
+  }
+  const notDone = await T.countDocuments({ status: { $ne: 'done' }, hidden: { $ne: true } });
+  out.push(`Abhi scrape baaki ya error wale titles: ${notDone}${notDone ? ' (auto-retry chal raha)' : ' ✅'}`);
+  const per = new Map((await E.aggregate([{ $group: { _id: '$series_slug', n: { $sum: 1 } } }]).toArray()).map((x) => [x._id, x.n]));
+  const series = await T.find({ type: 'series', status: 'done', 'claims.episodes': { $gt: 0 } }, { projection: { slug: 1, claims: 1 } }).toArray();
+  const bad = series.filter((s) => (per.get(s.slug) || 0) !== s.claims.episodes);
+  out.push(`Series jahan site ke "N Episodes" aur hamare episodes alag: ${bad.length}/${series.length}${bad.length ? '\n' + bad.slice(0, 10).map((s) => `  ${s.slug}: site ${s.claims.episodes} vs DB ${per.get(s.slug) || 0}`).join('\n') : ' ✅'}`);
+  const pendEp = await E.countDocuments({ scraped: false });
+  out.push(`Episodes jo abhi scrape hone baaki: ${pendEp}${pendEp ? '' : ' ✅'}`);
+  return out.join('\n');
 }
 
 async function testMode(db) {
@@ -968,7 +1035,30 @@ async function testMode(db) {
   }
 }
 
+/* MODE=probe : PROBE_URLS ke pages download karke Telegram bot pe .html file bhejta hai (DB nahi chahiye) */
+async function probeMode() {
+  const urls = String(process.env.PROBE_URLS || '').split(/[\s,]+/).filter((u) => /^https?:\/\//.test(u));
+  if (!urls.length) { log('PROBE_URLS khaali hai'); return; }
+  for (const u of urls) {
+    let body, note;
+    try { body = await get(u, 2); note = `OK ${body.length} chars`; }
+    catch (e) { note = 'FAIL: ' + (e.response ? 'HTTP ' + e.response.status : e.message); body = (e.response && typeof e.response.data === 'string') ? e.response.data : ''; }
+    log('probe', u, note);
+    if (!TG_TOKEN || !TG_CHAT) continue;
+    const name = (u.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').slice(0, 80) || 'page') + '.html';
+    try {
+      const fd = new FormData();
+      fd.append('chat_id', TG_CHAT);
+      fd.append('caption', (note + '\n' + u).slice(0, 1000));
+      fd.append('document', new Blob([body || '(empty)'], { type: 'text/html' }), name);
+      const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendDocument`, { method: 'POST', body: fd });
+      if (!r.ok) log('telegram file failed', r.status, (await r.text()).slice(0, 200));
+    } catch (e) { log('telegram file failed', e.message); }
+  }
+}
+
 async function main() {
+  if (MODE === 'probe') { await probeMode(); return; }
   if (MODE === 'count') { await countMode(); return; }
   if (!process.env.MONGO_URI) throw new Error('MONGO_URI variable set nahi hai');
   const { MongoClient } = require('mongodb');
@@ -1012,7 +1102,7 @@ async function main() {
   }
 }
 
-module.exports = { handleCommand, statusText, stats, flushErrors, logError, parseListing, parseArchive, metaFromText, parseServers, parseDownloads, parseSeasons, parseEpisodeList, parseEpisodePage, classify, epSlugParts, slugOf, decode, fallbackServers };
+module.exports = { auditText, maintenance, handleCommand, statusText, stats, flushErrors, logError, parseListing, parseArchive, metaFromText, parseServers, parseDownloads, parseSeasons, parseEpisodeList, parseEpisodePage, classify, epSlugParts, slugOf, decode, fallbackServers };
 
 if (require.main === module) {
   process.on('unhandledRejection', (e) => log('unhandledRejection', e && e.message));
