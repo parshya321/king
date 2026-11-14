@@ -133,14 +133,14 @@ async function flushErrors() {
   for (const e of list) byKind[e.kind] = (byKind[e.kind] || 0) + 1;
   const head = Object.entries(byKind).map(([k, n]) => `${k}: ${n}`).join(', ');
   const ex = list.slice(0, 5).map((e) => `- ${e.kind} ${e.id}: ${e.msg.slice(0, 90)}`).join('\n');
-  await tgSend(`⚠️ ${list.length} naye error (${head})\n${ex}${list.length > 5 ? `\n...aur ${list.length - 5}. Poori list: /errors` : ''}`);
+  await tgSend(`⚠️ Anime Scraper | ${list.length} new error${list.length === 1 ? '' : 's'}\nBy type: ${head}\n\n${ex}${list.length > 5 ? `\n...and ${list.length - 5} more. Full list: /errors` : ''}`);
 }
 
 const fmtDur = (min) => {
   if (!isFinite(min) || min < 0) return '?';
   if (min < 60) return `${Math.round(min)} min`;
   const h = Math.floor(min / 60);
-  return h < 48 ? `${h}h ${Math.round(min % 60)}m` : `${Math.round(h / 24)} din`;
+  return h < 48 ? `${h}h ${Math.round(min % 60)}m` : `${Math.round(h / 24)} days`;
 };
 const fmtN = (n) => Number(n).toLocaleString('en-US');
 
@@ -159,37 +159,51 @@ async function statusText(db) {
     T.countDocuments({ type: 'series', no_episodes: true }),
   ]);
   const perMin = last10 / 10;
-  const eta = perMin > 0 ? fmtDur(epend / perMin) : (epend ? 'speed 0, ruka hua?' : '-');
-  const d = stats.lastDeep ? stats.lastDeep.lines.join('\n  ') : 'abhi nahi hua';
+  const eta = perMin > 0 ? fmtDur(epend / perMin) : (epend ? 'stalled (speed 0)' : '-');
+  const d = stats.lastDeep ? stats.lastDeep.lines.map((l) => '• ' + l).join('\n') : '• Not run yet';
+  const PH = { idle: 'Idle (watching for new content)', discovery: 'Discovering titles', titles: 'Scraping titles', episodes: 'Scraping episodes', verify: 'Verifying' };
   return [
-    `📊 STATUS (phase: ${stats.phase})`,
-    `⏱ Chal raha: ${fmtDur((Date.now() - stats.startedAt) / 60000)}`,
+    `📊 ANIME CATALOG | STATUS REPORT`,
+    `Phase: ${PH[stats.phase] || stats.phase}`,
+    `Uptime: ${fmtDur((Date.now() - stats.startedAt) / 60000)}`,
     ``,
-    `🎬 Site ke titles mile: Series ${fmtN(ts)} | Movies ${fmtN(tm)} | hidden ${hidden}`,
-    `✅ Titles complete: ${fmtN(done)} | baaki: ${fmtN(pend)} | error: ${terr}${noEpTitles ? ` | bina episodes abhi: ${noEpTitles}` : ''}`,
-    `🟢 Live (Mini App ke liye ready): ${fmtN(live)} | 🔴 review chahiye: ${fmtN(review)}`,
+    `🎬 TITLES`,
+    `• Series: ${fmtN(ts)} | Movies: ${fmtN(tm)} | Hidden: ${hidden}`,
+    `• Complete: ${fmtN(done)} | Pending: ${fmtN(pend)} | Errors: ${terr}${noEpTitles ? ` | Series without episodes: ${noEpTitles}` : ''}`,
+    `• Live in Mini App: ${fmtN(live)} | Needs review: ${fmtN(review)}`,
     ``,
-    `📺 Episodes: mile ${fmtN(etot)} | scrape hue ${fmtN(edone)} | baaki ${fmtN(epend)} | fail ${fmtN(efail)} | bina server ${fmtN(nosrv)}`,
-    `⚡ Speed: ${perMin.toFixed(1)} episode/min (pichhle 10 min) | ETA: ${eta}`,
+    `📺 EPISODES`,
+    `• Found: ${fmtN(etot)} | Scraped: ${fmtN(edone)} | Pending: ${fmtN(epend)}`,
+    `• Failed: ${fmtN(efail)} | Without servers: ${fmtN(nosrv)}`,
+    `• Speed: ${perMin.toFixed(1)}/min (last 10 min) | ETA: ${eta}`,
     ``,
-    `⚠️ Errors: pichhle 1 ghante ${err1h} | start se ${stats.errorsTotal}`,
-    `🔗 Nayi titles related links se mili: ${stats.harvested}`,
-    `🔎 Last deep discovery:\n  ${d}`,
-    `🔄 Last sync: ${stats.lastSync ? fmtDur((Date.now() - stats.lastSync) / 60000) + ' pehle' : 'abhi nahi'}`,
+    `🩺 HEALTH`,
+    `• Errors: ${err1h} in the last hour | ${stats.errorsTotal} since start`,
+    `• New titles found via related links: ${stats.harvested}`,
+    `• Last sync: ${stats.lastSync ? fmtDur((Date.now() - stats.lastSync) / 60000) + ' ago' : 'not yet'}`,
+    ``,
+    `🔎 LAST DEEP DISCOVERY`,
+    d,
   ].join('\n');
 }
 
 const HELP = [
-  'Commands:',
-  '/status  : kitna data aaya, speed, ETA, errors',
-  '/audit   : saboot: site ke total vs hamare DB, kuch chhoota to nahi',
-  '/titles  : hamare saare titles ki list .txt file mein',
-  '/errors  : aakhri errors aur kitne kis type ke',
-  '/review  : jo titles verify mein fail hue (wajah ke saath)',
-  '/new     : site pe naye mile titles / badle links',
-  '/discover: site ko dobara poora khangalo (nayi titles dhundo)',
-  '/retry   : fail hue episodes/titles dobara try karo',
-  '/id      : apni chat ID',
+  '🤖 Infinite Animes | Admin Bot',
+  '',
+  'ANIME',
+  '/status   Catalog status: titles, episodes, speed, errors',
+  '/audit    Full check: site totals vs. our database',
+  '/titles   Download the list of all titles (.txt)',
+  '/errors   Latest errors, grouped by type',
+  '/review   Titles that failed verification, with reasons',
+  '/new      Newest titles and recently changed links',
+  '/discover Re-crawl the whole site for new titles',
+  '/retry    Retry failed episodes and titles',
+  '',
+  'MANGA',
+  '/manga    Manga status: titles, chapters, progress',
+  '',
+  '/id       Show this chat ID',
 ].join('\n');
 
 async function handleCommand(db, text, chatId) {
@@ -199,6 +213,11 @@ async function handleCommand(db, text, chatId) {
   if (cmd === '/id') return tgSend(`Chat ID: ${chatId}`, chatId);
   if (cmd === '/status') return tgSend(await statusText(db), chatId);
   if (cmd === '/audit') return tgSend(await auditText(db), chatId);
+  if (cmd === '/manga') {
+    let text;
+    try { text = await require('./manga').statusText(); } catch (e) { text = '📚 Manga worker is not running (' + e.message + ').'; }
+    return tgSend(text, chatId);
+  }
   if (cmd === '/titles') {
     // hamare saare titles ki list ek .txt file mein (type | slug | naam | languages)
     const rows = await T.find({}, { projection: { _id: 1, type: 1, slug: 1, title: 1, languages: 1 } }).toArray();
@@ -209,42 +228,42 @@ async function handleCommand(db, text, chatId) {
     try {
       const fd = new FormData();
       fd.append('chat_id', String(chatId));
-      fd.append('caption', `Hamare titles: ${lines.length}`);
+      fd.append('caption', `📄 Anime catalog: ${lines.length} titles\nFormat: type | slug | title | languages`);
       fd.append('document', new Blob([lines.join('\n')], { type: 'text/plain' }), 'our_titles.txt');
       const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendDocument`, { method: 'POST', body: fd });
-      if (!r.ok) return tgSend('File bhejne mein dikkat: HTTP ' + r.status, chatId);
-    } catch (e) { return tgSend('File bhejne mein dikkat: ' + e.message, chatId); }
+      if (!r.ok) return tgSend('❌ Could not send the file (HTTP ' + r.status + ').', chatId);
+    } catch (e) { return tgSend('❌ Could not send the file: ' + e.message, chatId); }
     return;
   }
   if (cmd === '/errors') {
     const last = await db.collection('errors').find({}).sort({ ts: -1 }).limit(15).toArray();
     const by = await db.collection('errors').aggregate([{ $match: { ts: { $gte: new Date(Date.now() - 86400000) } } }, { $group: { _id: '$kind', n: { $sum: 1 } } }]).toArray();
-    const head = by.length ? by.map((x) => `${x._id}: ${x.n}`).join(', ') : 'koi nahi';
+    const head = by.length ? by.map((x) => `${x._id}: ${x.n}`).join(', ') : 'none';
     const body = last.map((e) => `${e.ts.toISOString().slice(11, 16)} ${e.kind} ${e.id}\n   ${e.message.slice(0, 110)}`).join('\n');
-    return tgSend(`⚠️ Errors (24 ghante): ${head}\n\n${body || 'Abhi koi error nahi 🎉'}`, chatId);
+    return tgSend(`⚠️ ERRORS | LAST 24 HOURS\nBy type: ${head}\n\n${body || '✅ No errors.'}`, chatId);
   }
   if (cmd === '/review') {
     const n = await T.countDocuments({ status: 'done', live: false });
     const list = await T.find({ status: 'done', live: false }).sort({ verified_at: -1 }).limit(15).toArray();
     const body = list.map((t) => `${t.type}:${t.slug}\n   ${(t.errors || []).join(', ').slice(0, 120)}`).join('\n');
-    return tgSend(`🔴 Review chahiye: ${n}\n\n${body || 'Sab theek hai ✅'}`, chatId);
+    return tgSend(`🔴 NEEDS REVIEW: ${n} title${n === 1 ? '' : 's'}\n\n${body || '✅ Everything passed verification.'}`, chatId);
   }
   if (cmd === '/new') {
     const list = await T.find({}).sort({ first_seen: -1 }).limit(10).toArray();
     const ch = await E.find({ link_changed_at: { $exists: true } }).sort({ link_changed_at: -1 }).limit(5).toArray();
-    return tgSend(`🆕 Latest titles:\n${list.map((t) => `- ${t.type}:${t.slug} (${t.status})`).join('\n')}\n\n🔁 Links badle:\n${ch.map((e) => `- ${e._id}`).join('\n') || 'koi nahi'}`, chatId);
+    return tgSend(`🆕 NEWEST TITLES\n${list.map((t) => `• ${t.title || t.slug} (${t.type}, ${t.status})`).join('\n')}\n\n🔁 RECENTLY CHANGED LINKS\n${ch.map((e) => `• ${e._id}`).join('\n') || 'None'}`, chatId);
   }
   if (cmd === '/discover') {
     stats.forceDeep = true; wake();
-    return tgSend('🔎 Deep discovery queue mein hai. Agar abhi scrape chal raha hai to wo khatam hote hi shuru hogi.', chatId);
+    return tgSend('🔎 Deep discovery queued. It starts as soon as the current run finishes.', chatId);
   }
   if (cmd === '/retry') {
     const a = await E.updateMany({ scraped: false, attempts: { $gte: MAX_ATTEMPTS } }, { $set: { attempts: 0 } });
     const b = await T.updateMany({ status: 'error' }, { $set: { attempts: 0 } });
     wake();
-    return tgSend(`🔁 Dobara try: ${a.modifiedCount} episodes, ${b.modifiedCount} titles.`, chatId);
+    return tgSend(`🔁 Retry queued: ${a.modifiedCount} episodes, ${b.modifiedCount} titles.`, chatId);
   }
-  return tgSend('Samjha nahi. /help dekho.', chatId);
+  return tgSend('Unknown command. Send /help to see all commands.', chatId);
 }
 
 async function tgLoop(db) {
@@ -259,11 +278,11 @@ async function tgLoop(db) {
         if (!m || !m.text) continue;
         const chatId = String(m.chat.id);
         if (!TG_CHAT) { // TG_CHAT_ID abhi set nahi: sirf chat ID bata do
-          if (/^\/(id|start)/i.test(m.text)) await tgSend(`Tumhari chat ID: ${chatId}\nIse Railway Variables mein TG_CHAT_ID naam se daalo aur redeploy karo.`, chatId);
+          if (/^\/(id|start)/i.test(m.text)) await tgSend(`Your chat ID: ${chatId}\nAdd it to Railway Variables as TG_CHAT_ID and redeploy.`, chatId);
           continue;
         }
         if (chatId !== TG_CHAT) continue; // koi aur bot use na kar sake
-        try { await handleCommand(db, m.text, chatId); } catch (e) { await tgSend('Command error: ' + e.message, chatId); }
+        try { await handleCommand(db, m.text, chatId); } catch (e) { await tgSend('❌ Command failed: ' + e.message, chatId); }
       }
     } catch (e) {
       const st = e.response && e.response.status;
@@ -937,23 +956,23 @@ async function reconcile(found) {
     totals[type] = r.total != null ? r.total : r.items.length;
     const inSm = [...sitemapSet].filter((k) => k.startsWith(type + ':')).length;
     const lost = r.items.filter((i) => !sitemapSet.has(`${type}:${i.slug}`)).length;
-    lines.push(`${kind.toUpperCase()}: site ka exact total ${r.total != null ? r.total : r.items.length} (via ${source}) | sitemap ${inSm} | sitemap mein nahi ${lost}`);
+    lines.push(`${kind === 'series' ? 'Series' : 'Movies'}: ${r.total != null ? r.total : r.items.length} on site (via ${source}) | ${inSm} in sitemap | ${lost} missing from sitemap`);
   }
   if (process.env.DEEP_LISTINGS !== '0') {
     try {
       const l = await listingsCrawl();
       for (const [k, v] of l.items) if (!site.has(k)) site.set(k, { ...v, lastmod: null });
-      lines.push(`LISTINGS: ${l.listings} listing pages, ${l.pages} pages dekhe, ${l.items.size} titles mile`);
-    } catch (e) { log('listings crawl error:', e.message); lines.push('LISTINGS: error ' + e.message); }
+      lines.push(`Listings: ${l.listings} listing pages, ${l.pages} pages checked, ${l.items.size} titles found`);
+    } catch (e) { log('listings crawl error:', e.message); lines.push('Listings: failed (' + e.message + ')'); }
   }
   const extras = [...site.entries()].filter(([k]) => !sitemapSet.has(k)).map(([, v]) => v);
   const union = new Set([...sitemapSet, ...site.keys()]);
-  lines.push(`TOTAL (sab sources milake): ${union.size} titles | sitemap se alag mile: ${extras.length}`);
+  lines.push(`Total (all sources combined): ${union.size} titles | found outside sitemap: ${extras.length}`);
   stats.siteTotals = totals;
   stats.siteKeys = [...union];
   lines.forEach((l) => log('DISCOVERY ' + l));
   stats.lastDeep = { at: new Date(), lines };
-  await tgSend('🔎 Deep discovery\n' + lines.join('\n') + (extras.length ? `\nChhoote hue (pehle 10): ${extras.slice(0, 10).map((e) => e.slug).join(', ')}` : ''));
+  await tgSend('🔎 ANIME | DEEP DISCOVERY\n' + lines.map((l) => '• ' + l).join('\n') + (extras.length ? `\n\nMissing from sitemap (first 10): ${extras.slice(0, 10).map((e) => e.slug).join(', ')}` : ''));
   return extras;
 }
 
@@ -990,9 +1009,9 @@ async function runOnce(db, watch) {
   stats.phase = 'idle';
   if (!stats.firstRunDone) {
     stats.firstRunDone = true;
-    await tgSend('✅ Pehla poora scrape khatam!' + (v ? `\nVerify: live ${v.live} | review ${v.blocked}` : '') + '\n\n' + (await statusText(db)));
+    await tgSend('✅ ANIME | FULL SCRAPE COMPLETE' + (v ? `\nVerification: ${v.live} live | ${v.blocked} need review` : '') + '\n\n' + (await statusText(db)));
   } else if (watch && (r.added || r.changed)) {
-    await tgSend(`🆕 Anime Salt sync: ${r.added} naye, ${r.changed} badle.\n${r.newTitles.slice(0, 15).join(', ')}`);
+    await tgSend(`🆕 ANIME | NEW CONTENT\nNew titles: ${r.added} | Updated: ${r.changed}${r.newTitles.length ? '\n\n' + r.newTitles.slice(0, 15).map((t) => '• ' + t).join('\n') : ''}`);
   }
 }
 
@@ -1009,12 +1028,12 @@ async function maintenance(db) {
 
 async function auditText(db) {
   const T = db.collection('titles'), E = db.collection('episodes');
-  const out = ['🧾 AUDIT: kuch chhoota to nahi?'];
+  const out = ['🧾 ANIME | CATALOG AUDIT', 'Checks that nothing on the site is missing from our database.', ''];
   const tot = stats.siteTotals;
   for (const type of ['series', 'movie']) {
     const have = await T.countDocuments({ type, hidden: { $ne: true } });
     const site = tot ? tot[type] : null;
-    out.push(`${type === 'series' ? 'Series' : 'Movies'}: site ${site != null ? site : '? (/discover chalao)'} | hamare DB mein ${have} ${site != null ? (have >= site ? '✅' : `❌ ${site - have} kam`) : ''}`);
+    out.push(`${type === 'series' ? 'Series' : 'Movies'}: ${site != null ? site : '? (run /discover)'} on site | ${have} in database ${site != null ? (have >= site ? '✅' : `❌ ${site - have} missing`) : ''}`);
   }
   if (stats.siteKeys) {
     let missing = 0; const sample = [];
@@ -1023,16 +1042,16 @@ async function auditText(db) {
       const have = new Set((await T.find({ _id: { $in: chunk } }, { projection: { _id: 1 } }).toArray()).map((d) => d._id));
       for (const k of chunk) if (!have.has(k)) { missing++; if (sample.length < 10) sample.push(k); }
     }
-    out.push(`Site ki list ke ${stats.siteKeys.length} titles mein se DB mein nahi: ${missing}${missing ? '\n  ' + sample.join(', ') : ' ✅'}`);
+    out.push(`Site titles not in database: ${missing} of ${stats.siteKeys.length}${missing ? '\n  ' + sample.join(', ') : ' ✅'}`);
   }
   const notDone = await T.countDocuments({ status: { $ne: 'done' }, hidden: { $ne: true } });
-  out.push(`Abhi scrape baaki ya error wale titles: ${notDone}${notDone ? ' (auto-retry chal raha)' : ' ✅'}`);
+  out.push(`Titles pending or with errors: ${notDone}${notDone ? ' (auto-retry is running)' : ' ✅'}`);
   const per = new Map((await E.aggregate([{ $group: { _id: '$series_slug', n: { $sum: 1 } } }]).toArray()).map((x) => [x._id, x.n]));
   const series = await T.find({ type: 'series', status: 'done', 'claims.episodes': { $gt: 0 } }, { projection: { slug: 1, claims: 1 } }).toArray();
   const bad = series.filter((s) => (per.get(s.slug) || 0) !== s.claims.episodes);
-  out.push(`Series jahan site ke "N Episodes" aur hamare episodes alag: ${bad.length}/${series.length}${bad.length ? '\n' + bad.slice(0, 10).map((s) => `  ${s.slug}: site ${s.claims.episodes} vs DB ${per.get(s.slug) || 0}`).join('\n') : ' ✅'}`);
+  out.push(`Series whose episode count differs from the site: ${bad.length} of ${series.length}${bad.length ? '\n' + bad.slice(0, 10).map((s) => `  ${s.slug}: site ${s.claims.episodes} vs database ${per.get(s.slug) || 0}`).join('\n') : ' ✅'}`);
   const pendEp = await E.countDocuments({ scraped: false });
-  out.push(`Episodes jo abhi scrape hone baaki: ${pendEp}${pendEp ? '' : ' ✅'}`);
+  out.push(`Episodes still to scrape: ${pendEp}${pendEp ? '' : ' ✅'}`);
   return out.join('\n');
 }
 
@@ -1118,16 +1137,16 @@ async function main() {
   if (TG_TOKEN) {
     tgLoop(db).catch((e) => log('tgLoop band:', e.message));
     reporterLoop(db).catch((e) => log('reporterLoop band:', e.message));
-    await tgSend(`🚀 Scraper chalu hua (db: ${DB_NAME}). Commands ke liye /help bhejo.`);
+    await tgSend(`🚀 Anime scraper started (database: ${DB_NAME}).\nSend /help for commands.`);
   } else {
     log('TG_BOT_TOKEN set nahi: Telegram alerts band');
   }
-  try { await runOnce(db, false); } catch (e) { log('FIRST RUN ERROR', e.message); await logError(db, 'run', 'first', e.message); await notify('❌ Scraper error: ' + e.message); }
+  try { await runOnce(db, false); } catch (e) { log('FIRST RUN ERROR', e.message); await logError(db, 'run', 'first', e.message); await notify('❌ Anime scraper error: ' + e.message); }
   stats.phase = 'idle';
   log(`watcher chalu: har ${WATCH_MIN} minute mein check`);
   for (;;) {
     await nap(WATCH_MIN * 60 * 1000);
-    try { await runOnce(db, true); } catch (e) { log('WATCH ERROR', e.message); await logError(db, 'run', 'watch', e.message); await notify('❌ Scraper error: ' + e.message); }
+    try { await runOnce(db, true); } catch (e) { log('WATCH ERROR', e.message); await logError(db, 'run', 'watch', e.message); await notify('❌ Anime scraper error: ' + e.message); }
     stats.phase = 'idle';
   }
 }
