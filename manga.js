@@ -36,7 +36,7 @@ const LANG_NAME = env('MANGA_LANG_NAME', 'English');
 const MODE = env('MANGA_MODE', 'run').toLowerCase();
 const TEST_SLUGS = String(env('TEST_SLUGS', 'naruto-official-colored,rise-of-the-limitless-necromancer')).split(/[\s,]+/).filter(Boolean);
 const CONC_TITLES = +env('CONCURRENCY_TITLES', 3);
-const CONC_WALK = +env('CONCURRENCY_WALK', 3);
+const CONC_WALK = +env('CONCURRENCY_WALK', 4);
 const DELAY_MS = +env('DELAY_MS', 300);
 const WATCH_MINUTES = +env('WATCH_MINUTES', 60);
 const REPORT_MINUTES = +env('REPORT_MINUTES', 60);
@@ -272,7 +272,7 @@ async function doManga(slug, lastmod, isNew) {
     if (isNew && r.total > 0) { stats.newManga++; stats.newList.push(`📖 ${info.title} (new, ${r.total} chapters)`); }
     else if (!isNew && r.added > 0) { stats.newChapters += r.added; stats.newList.push(`➕ ${info.title}: ${r.added} new chapter${r.added === 1 ? '' : 's'}`); }
     if (stats.newList.length > 200) stats.newList.shift();
-    if (r.needWalk) await walk(slug);
+    // lambi chapter list (walk) yahan nahi: pehle saare manga, phir sync ke doosre hisse mein walk
     return { info, ...r };
   } catch (e) {
     if (e.notFound) { await M.updateOne({ _id: slug }, { $set: { state: 'gone', live: false } }); return null; }
