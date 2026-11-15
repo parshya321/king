@@ -95,7 +95,7 @@ async function get(url, tries = 4) {
 const TG_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT = String(process.env.TG_CHAT_ID || '').trim();
 const REPORT_MIN = +process.env.REPORT_MINUTES || 30;
-const stats = { startedAt: Date.now(), phase: 'start', lastSync: null, lastDeep: null, pendingErr: [], errorsTotal: 0, harvested: 0, firstRunDone: false, forceDeep: false };
+const stats = { linkChanges: {}, lastRefreshAt: 0, startedAt: Date.now(), phase: 'start', lastSync: null, lastDeep: null, pendingErr: [], errorsTotal: 0, harvested: 0, firstRunDone: false, forceDeep: false };
 
 let wakeFn = null;
 const nap = (ms) => new Promise((res) => {
@@ -199,6 +199,8 @@ const HELP = [
   '/new      Newest titles and recently changed links',
   '/discover Re-crawl the whole site for new titles',
   '/retry    Retry failed episodes and titles',
+  '/refresh  Re-check one title now: /refresh <slug or link>',
+  '          (all links are re-checked automatically every 2 hours)',
   '',
   'MANGA',
   '/manga    Manga status: titles, chapters, progress',
@@ -256,6 +258,19 @@ async function handleCommand(db, text, chatId) {
   if (cmd === '/discover') {
     stats.forceDeep = true; wake();
     return tgSend('🔎 Deep discovery queued. It starts as soon as the current run finishes.', chatId);
+  }
+  if (cmd === '/refresh') {
+    // ek title ke saare links site se dobara padho: /refresh boruto-naruto-next-generations  (ya poora link)
+    let arg = (text.trim().split(/\s+/)[1] || '').trim();
+    const m = arg.match(/\/(series|movies|episode)\/([^/?#]+)/);
+    if (m) arg = m[1] === 'episode' ? m[2].replace(/-\d+x\d+$/, '') : m[2];
+    if (!arg) return tgSend('Usage: /refresh <slug or link>\nExample: /refresh boruto-naruto-next-generations', chatId);
+    const t = await T.findOne({ slug: arg });
+    if (!t) return tgSend(`❌ No title found for "${arg}".`, chatId);
+    await T.updateOne({ _id: t._id }, { $set: { needs_refresh: true, attempts: 0 } });
+    const e = await E.updateMany({ series_slug: t.slug }, { $set: { scraped: false, attempts: 0 } });
+    wake();
+    return tgSend(`🔄 Refresh queued: ${t.title || t.slug}\nEpisodes to re-check: ${e.modifiedCount}. New links will be live in a few minutes.`, chatId);
   }
   if (cmd === '/retry') {
     const a = await E.updateMany({ scraped: false, attempts: { $gte: MAX_ATTEMPTS } }, { $set: { attempts: 0 } });
@@ -722,10 +737,15 @@ async function processEpisode(db, ep) {
     if (!p.servers.length) flags.push('no_servers');
     const fp = crypto.createHash('sha1').update(JSON.stringify([p.servers, p.downloads])).digest('hex');
     const changed = ep.fingerprint && ep.fingerprint !== fp;
+    if (changed) {
+      const k = ep.series_title || ep.series_slug || ep._id;
+      const c = stats.linkChanges[k] || (stats.linkChanges[k] = { n: 0, eps: [] });
+      c.n++; if (c.eps.length < 6) c.eps.push(ep.season != null ? `S${ep.season}E${ep.ep_num}` : 'movie');
+    }
     await col.updateOne({ _id: ep._id }, {
       $set: {
         servers: p.servers, downloads: p.downloads, post_id: p.postId, page_title: p.title,
-        flags, fingerprint: fp, scraped: true, attempts: 0, scraped_at: new Date(),
+        flags, fingerprint: fp, scraped: true, attempts: 0, scraped_at: new Date(), refresh_check: false,
         ...(changed ? { link_changed_at: new Date() } : {}),
       },
     });
@@ -1000,8 +1020,18 @@ async function runOnce(db, watch) {
   log(`sitemap: ${found.length} titles | new ${r.added} | changed ${r.changed}`);
   stats.phase = 'titles';
   const a = await processTitles(db);
+  try { await linkRefresh(db); } catch (e) { log('link refresh error:', e.message); }
   stats.phase = 'episodes';
   const b = await processEpisodes(db);
+  const lc = Object.entries(stats.linkChanges);
+  if (lc.length && stats.firstRunDone) {
+    const tot = lc.reduce((a, [, v]) => a + v.n, 0);
+    lc.sort((a, b2) => b2[1].n - a[1].n);
+    await tgSend(['🔁 ANIME | VIDEO LINKS UPDATED', `The site changed ${tot} link${tot === 1 ? '' : 's'} in ${lc.length} title${lc.length === 1 ? '' : 's'}. The Mini App already uses the new links.`, '',
+      ...lc.slice(0, 20).map(([k, v]) => `• ${k}: ${v.n} episode${v.n === 1 ? '' : 's'} (${v.eps.join(', ')}${v.n > v.eps.length ? ', …' : ''})`),
+      ...(lc.length > 20 ? [`...and ${lc.length - 20} more titles`] : [])].join('\n'));
+  }
+  stats.linkChanges = {};
   await finalize(db);
   stats.phase = 'verify';
   let v = null;
@@ -1016,6 +1046,21 @@ async function runOnce(db, watch) {
 }
 
 // roz ek baar: jo kuch adhoora ya shak wala dikha use dobara check karne ke liye queue karo
+/* Har REFRESH_HOURS (default 2) ghante: sabse purane episodes ke links site se dobara padho.
+   Batch itna bada ki poori library ~1 din mein ek baar check ho jaye (site pe halka load). */
+async function linkRefresh(db) {
+  const hrs = +process.env.REFRESH_HOURS || 2;
+  if (stats.lastRefreshAt && Date.now() - stats.lastRefreshAt < hrs * 3600e3) return 0;
+  stats.lastRefreshAt = Date.now();
+  const E = db.collection('episodes');
+  const total = await E.estimatedDocumentCount();
+  const per = +process.env.REFRESH_BATCH || Math.ceil(total / (24 / hrs));
+  const old = await E.find({ scraped: true, scraped_at: { $lt: new Date(Date.now() - hrs * 3600e3) } }, { projection: { _id: 1 } }).sort({ scraped_at: 1 }).limit(per).toArray();
+  if (old.length) await E.updateMany({ _id: { $in: old.map((x) => x._id) } }, { $set: { scraped: false, attempts: 0, refresh_check: true } });
+  log(`link refresh: ${old.length} episodes dobara check honge`);
+  return old.length;
+}
+
 async function maintenance(db) {
   const E = db.collection('episodes'), T = db.collection('titles');
   const dayAgo = new Date(Date.now() - 24 * 3600 * 1000);
@@ -1024,6 +1069,7 @@ async function maintenance(db) {
     { status: 'done', live: false, hidden: { $ne: true }, errors: { $regex: /^(zero_episodes|season_count|duplicate|unscraped)/ } },
     { $set: { needs_refresh: true, attempts: 0 } });
   log(`maintenance: ${a.modifiedCount} no_server episodes, ${b.modifiedCount} adhoore titles dobara queue mein`);
+
 }
 
 async function auditText(db) {
