@@ -1201,8 +1201,8 @@ module.exports = { auditText, maintenance, handleCommand, statusText, stats, flu
 
 if (require.main === module) {
   process.on('unhandledRejection', (e) => log('unhandledRejection', e && e.message));
-  // manga worker isi service mein (band karna ho to MANGA=off)
-  if (String(process.env.MANGA || 'on').toLowerCase() !== 'off' && MODE === 'run') {
+  // manga worker ab band hai (dobara chalana ho to Railway variable MANGA=on)
+  if (String(process.env.MANGA || 'off').toLowerCase() === 'on' && MODE === 'run') {
     try { require('./manga').start(); } catch (e) { log('manga worker start failed:', e.message); }
   }
   main().then(() => { if (MODE !== 'run') process.exit(0); }).catch((e) => { console.error(e); process.exit(1); });
