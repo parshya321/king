@@ -107,4 +107,32 @@ async function buildServers(base, options, dubOf) {
   return servers;
 }
 
-module.exports = { parseSeries, parseEpisode, parseDub, buildServers, parseNum, slugOfUrl };
+/* ---- /wawtest: ek baar normal request se dekhna ki site data deti hai ya nahi (koi retry/bypass nahi) ---- */
+async function probe(fetchOnce, seriesUrl) {
+  const out = [];
+  const tryGet = async (label, url) => {
+    try {
+      const r = await fetchOnce(url);
+      const challenge = /<title>\s*Just a moment/i.test(r.body) || ([403, 429, 503].includes(r.status) && /cf-chl|challenge-platform|cloudflare/i.test(r.body));
+      out.push(`${label}: HTTP ${r.status}${challenge ? ' - Cloudflare challenge (blocked)' : (r.status >= 400 ? ' - refused' : ' - OK')} (${r.body.length} bytes)`);
+      return challenge ? null : r.body;
+    } catch (e) {
+      out.push(`${label}: ${e.response ? 'HTTP ' + e.response.status + ' (blocked/refused)' : e.message}`);
+      return null;
+    }
+  };
+  const sHtml = await tryGet('Series page', seriesUrl);
+  if (!sHtml) return out.join('\n');
+  const s = parseSeries(sHtml);
+  out.push(`  title: ${s.title || '?'} | episodes found: ${s.episodes.length}`);
+  if (!s.episodes.length) return out.join('\n');
+  const eHtml = await tryGet('Episode page', s.episodes[0].url);
+  if (!eHtml) return out.join('\n');
+  const opts = parseEpisode(eHtml);
+  out.push(`  options: ${opts.map((o) => o.src).join(' , ') || 'none'}`);
+  const servers = await buildServers(s.episodes[0].url, opts, (u) => fetchOnce(u).then((r) => r.body).catch(() => null));
+  out.push(`  servers built: ${servers.map((x) => x.lang + ':' + x.host).join(', ') || 'none'}`);
+  return out.join('\n');
+}
+
+module.exports = { probe, parseSeries, parseEpisode, parseDub, buildServers, parseNum, slugOfUrl };

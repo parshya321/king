@@ -204,6 +204,7 @@ const HELP = [
   '',
   'MANGA',
   '/manga    Manga status: titles, chapters, progress',
+  '/wawtest  Check watchanimeworld access (one request, FMAB)',
   '',
   '/id       Show this chat ID',
 ].join('\n');
@@ -215,6 +216,15 @@ async function handleCommand(db, text, chatId) {
   if (cmd === '/id') return tgSend(`Chat ID: ${chatId}`, chatId);
   if (cmd === '/status') return tgSend(await statusText(db), chatId);
   if (cmd === '/audit') return tgSend(await auditText(db), chatId);
+  if (cmd === '/wawtest') {
+    // watchanimeworld: sirf ek normal request se check (retry nahi). /wawtest <series url> (default FMAB)
+    const url = text.trim().split(/\s+/)[1] || 'https://watchanimeworld.one/series/fullmetal-alchemist-brotherhood/';
+    let msg;
+    try {
+      msg = await require('./waw').probe(async (u) => { const r = await http().get(u, { headers: extraHeaders(u), validateStatus: () => true }); return { status: r.status, body: String(r.data) }; }, url);
+    } catch (e) { msg = 'wawtest error: ' + e.message; }
+    return tgSend('🌐 WAW TEST\n' + msg, chatId);
+  }
   if (cmd === '/manga') {
     let text;
     try { text = await require('./manga').statusText(); } catch (e) { text = '📚 Manga worker is not running (' + e.message + ').'; }
