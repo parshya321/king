@@ -251,12 +251,8 @@ class Engine:
         max_att = self.db.int("max_att")
         self.winner = None
         self.stop = asyncio.Event()
-        n = len(stats)
         started = self.now()
-        await asyncio.gather(*(
-            self._worker(st, epoch + gap * i / n, gap, end, max_att, target, jit)
-            for i, st in enumerate(stats)
-        ))
+        await self._dispatch(stats, epoch, gap, end, max_att, target, jit)
         finished = self.now()
         report = self._report(stats, target, epoch, started, finished)
         self.db.add_report(time.time(), report)
@@ -265,28 +261,50 @@ class Engine:
             kb = [[("👤 Profile username pe lagao", f"mv:{self.winner.acc['id']}")]]
         await self.notify(report, kb)
 
-    async def _worker(self, st: Stat, first_at, gap, end, max_att, target, jit=0.0):
+    async def _dispatch(self, stats, first_at, gap, end, max_att, target, jit):
+        """Sab accounts ke liye ek hi gap, baari-baari: acc1, gap, acc2, gap, acc3 ... phir wapas acc1.
+        Jis account par FloodWait hai ya jo dead hai, uski baari chhod di jati hai."""
+        n = len(stats)
+        idx = 0
         nxt = first_at
         tasks = []
-        while not self.stop.is_set() and not st.dead:
+
+        def usable(st, t):
+            if st.dead or (max_att and st.attempts >= max_att):
+                return False
+            return st.paused_until <= t and st.inflight < 4
+
+        while not self.stop.is_set():
             t = self.now()
-            if t >= end or (max_att and st.attempts >= max_att):
+            if t >= end:
                 break
-            if st.paused_until > t:
-                if st.paused_until >= end:
+            # koi account bacha hi nahi (sab dead / max attempts)?
+            if all(st.dead or (max_att and st.attempts >= max_att) for st in stats):
+                break
+            if t < nxt:
+                await self._sleep_until(min(nxt, end))
+                continue
+            pick = None
+            for k in range(n):
+                st = stats[(idx + k) % n]
+                if usable(st, t):
+                    pick = (idx + k) % n
                     break
-                await asyncio.sleep(min(st.paused_until - t, 1))
+            if pick is None:  # sab FloodWait me: sabse jaldi wala khulne tak ruko
+                wake = min((st.paused_until for st in stats if not st.dead and not (max_att and st.attempts >= max_att)), default=t + 1)
+                if wake >= end:
+                    break
+                await asyncio.sleep(min(max(wake - t, 0.05), 1))
                 nxt = max(nxt, self.now())
                 continue
-            if t < nxt:
-                await self._sleep_until(nxt)
-                continue
-            if st.inflight < 4:
-                st.attempts += 1
-                tasks.append(asyncio.create_task(self._attempt(st, target)))
-            nxt += gap * random.uniform(1 - jit, 1 + jit)  # thoda random gap: har try ek jaise fasle par nahi
+            st = stats[pick]
+            st.attempts += 1
+            tasks.append(asyncio.create_task(self._attempt(st, target)))
+            idx = (pick + 1) % n
+            nxt += gap * random.uniform(1 - jit, 1 + jit)  # thoda random: har try ek jaise fasle par nahi
             if nxt < t - gap:  # peeche reh gaye to burst nahi
                 nxt = t + gap
+            tasks = [x for x in tasks if not x.done()]
             await asyncio.sleep(0)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)

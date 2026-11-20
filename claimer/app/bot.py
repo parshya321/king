@@ -117,7 +117,8 @@ def settings_view(adv=False):
         text = (
             "⚙️ <b>Settings</b>\n\n"
             f"🎯 Target: <code>@{html.escape(g('target') or '—')}</code>\n"
-            f"⏱ Gap: <b>{gap_s()} second</b> (+/- {g('jitter_pct')}% random)\n\n"
+            f"⏱ Gap: <b>{gap_s()} second</b> (+/- {g('jitter_pct')}% random)\n"
+            "Accounts baari-baari se chalte hain, har try ke beech itna gap.\n\n"
             "Chalane ke liye: <code>/set @username</code>   Rokne ke liye: /stop"
         )
         rows = [
@@ -130,7 +131,7 @@ def settings_view(adv=False):
     text = (
         "🔧 <b>Advanced settings</b>\n\n"
         f"🎯 Target: <code>@{html.escape(g('target') or '—')}</code>\n"
-        f"⏱ Gap: <b>{gap_s()} second</b> (har account ke 2 tries ke beech)\n"
+        f"⏱ Gap: <b>{gap_s()} second</b> (do tries ke beech, accounts baari-baari)\n"
         f"🎲 Random: <b>+/- {g('jitter_pct')}%</b> (gap me thoda upar-neeche, 0 = fixed)\n"
         f"🔢 Max attempts/account: <b>{g('max_att')}</b> (0 = unlimited)\n"
         f"🔔 FloodWait notify: <b>{'ON' if g('notify') == '1' else 'OFF'}</b>"
