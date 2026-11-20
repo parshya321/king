@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateUsernameRequest as AccUser
-from telethon.tl.functions.channels import CreateChannelRequest
+from telethon.tl.functions.channels import CreateChannelRequest, GetAdminedPublicChannelsRequest
 from telethon.tl.functions.channels import UpdateUsernameRequest as ChUser
 from telethon.tl.types import Channel
 
@@ -141,7 +141,31 @@ class Engine:
         return ch
 
     async def ensure_channel(self, acc: dict, client: TelegramClient) -> tuple[Channel, str]:
-        """Public channel dhoondo (saved ya existing), warna nayi banao."""
+        """Claim ke liye channel chunna.
+        channel_prefix set ho (default 'p'): account ki apni public channel jiska username us letter se shuru ho.
+        Nayi channel BANAI NAHI JATI (channel banana + username lagana naye accounts par FloodWait deta hai)."""
+        prefix = (self.db.get("channel_prefix") or "").strip().lower().lstrip("@")
+        if prefix:
+            pub = []
+            try:  # account ki owned public channels seedhi list
+                res = await client(GetAdminedPublicChannelsRequest())
+                pub = [c for c in res.chats if isinstance(c, Channel) and c.username]
+            except Exception as e:
+                log.warning("getAdminedPublicChannels fail: %r", e)
+            match = [c for c in pub if c.username.lower().startswith(prefix)]
+            if match:
+                saved = acc.get("channel_id")
+                ch = next((c for c in match if c.id == saved), match[0])
+                self.db.update_account(acc["id"], channel_id=ch.id)
+                return ch, f"'{prefix.upper()}' se shuru hone wali channel mili"
+            if acc.get("channel_id"):  # pehle claim ho chuki channel (username ab target hai) dobara use ho sake
+                dialogs = [d.entity async for d in client.iter_dialogs(limit=300) if isinstance(d.entity, Channel)]
+                for e in dialogs:
+                    if e.id == acc["channel_id"] and e.broadcast and e.creator:
+                        return await self._make_public(client, e), "saved channel"
+            raise RuntimeError(f"is account me '{prefix.upper()}' se shuru hone wali public channel nahi mili. "
+                               f"Telegram app me ek public channel banao jiska username '{prefix.upper()}' se shuru ho, "
+                               "phir account dobara add karo (ya /menu me use dobara activate karo).")
         dialogs = [d.entity async for d in client.iter_dialogs(limit=300) if isinstance(d.entity, Channel)]
         owned = [e for e in dialogs if e.broadcast and e.creator]
         if acc.get("channel_id"):
@@ -212,7 +236,12 @@ class Engine:
             try:
                 client = await self.client_for(acc)
                 ch, how = await self.ensure_channel(acc, client)
-                stats.append(Stat(acc=acc, client=client, channel=ch))
+                stat = Stat(acc=acc, client=client, channel=ch)
+                try:  # restart se pehle ka FloodWait yaad rakho (server par wo chalta rehta hai)
+                    stat.paused_until = float(self.db.get(f"flood_until_{acc['id']}") or 0) - self.offset
+                except ValueError:
+                    pass
+                stats.append(stat)
             except Exception as e:
                 await self.notify(f"⚠️ Account <b>{html.escape(acc.get('phone') or '?')}</b> ready nahi hua: {html.escape(str(e))}")
 
@@ -257,11 +286,12 @@ class Engine:
         end = float("inf") if forever else epoch + self.db.int("window_s")
         jit = min(max(self.db.int("jitter_pct"), 0), 50) / 100
         max_att = self.db.int("max_att")
+        min_gap = max(self.db.int("acct_gap_s"), 0)
         self.winner = None
         self.stop = asyncio.Event()
         started = self.now()
         self.live, self.run_target, self.run_started = stats, target, time.time()
-        await self._dispatch(stats, epoch, gap, end, max_att, target, jit)
+        await self._dispatch(stats, epoch, gap, end, max_att, target, jit, min_gap)
         finished = self.now()
         report = self._report(stats, target, epoch, started, finished)
         self.db.add_report(time.time(), report)
@@ -270,7 +300,7 @@ class Engine:
             kb = [[("👤 Profile username pe lagao", f"mv:{self.winner.acc['id']}")]]
         await self.notify(report, kb)
 
-    async def _dispatch(self, stats, first_at, gap, end, max_att, target, jit):
+    async def _dispatch(self, stats, first_at, gap, end, max_att, target, jit, min_gap=0):
         """Sab accounts ke liye ek hi gap, baari-baari: acc1, gap, acc2, gap, acc3 ... phir wapas acc1.
         Jis account par FloodWait hai ya jo dead hai, uski baari chhod di jati hai."""
         n = len(stats)
@@ -278,10 +308,17 @@ class Engine:
         nxt = first_at
         tasks = []
 
+        def wait_for(st, t):
+            """Is account ko try karne me kitne second baaki (FloodWait + compulsory per-account gap)."""
+            w = st.paused_until - t
+            if st.last_try:
+                w = max(w, st.last_try + min_gap - time.time())
+            return max(w, 0.0)
+
         def usable(st, t):
             if st.dead or (max_att and st.attempts >= max_att):
                 return False
-            return st.paused_until <= t and st.inflight < 4
+            return wait_for(st, t) <= 0 and st.inflight < 4
 
         while not self.stop.is_set():
             t = self.now()
@@ -299,11 +336,12 @@ class Engine:
                 if usable(st, t):
                     pick = (idx + k) % n
                     break
-            if pick is None:  # sab FloodWait me: sabse jaldi wala khulne tak ruko
-                wake = min((st.paused_until for st in stats if not st.dead and not (max_att and st.attempts >= max_att)), default=t + 1)
-                if wake >= end:
+            if pick is None:  # sab FloodWait/per-account gap me: sabse jaldi wala khulne tak ruko
+                waits = [wait_for(st, t) for st in stats if not st.dead and not (max_att and st.attempts >= max_att)]
+                wake = min(waits, default=1.0)
+                if t + wake >= end:
                     break
-                await asyncio.sleep(min(max(wake - t, 0.05), 1))
+                await asyncio.sleep(min(max(wake, 0.05), 1))
                 nxt = max(nxt, self.now())
                 continue
             st = stats[pick]
@@ -336,10 +374,13 @@ class Engine:
             st.errors["FloodWait"] += 1
             st.floods.append((ts, e.seconds))
             st.paused_until = self.now() + e.seconds
-            req = type(getattr(e, "request", None)).__name__ if getattr(e, "request", None) is not None else "?"
+            self.db.set(f"flood_until_{st.acc['id']}", time.time() + e.seconds)
+            rq = getattr(e, "request", None)
+            rq = getattr(rq, "query", rq)  # receive_updates=False me request InvokeWithoutUpdates me lipti hoti hai
+            req = type(rq).__name__ if rq is not None else "?"
             await self.notify(f"⏳ <b>FloodWait</b>: <code>{html.escape(st.label)}</code> par "
                               f"<b>{e.seconds}s</b> ka flood wait laga ({fmt_ts(ts)}), request: <code>{req}</code>, "
-                              f"is account ki try #{n + 1} par (sab accounts milake kul {sum(x.attempts for x in self.live)} tries ke baad). "
+                              f"is account ki try #{n} par (sab accounts milake kul {sum(x.attempts for x in self.live)} tries ke baad). "
                               f"Itni der ye account pause.")
         except errors.RPCError as e:
             name = type(e).__name__

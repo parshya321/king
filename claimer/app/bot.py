@@ -137,7 +137,7 @@ def stats_text() -> str:
     L.append(f"{state}\n🎯 Username: <code>@{html.escape(engine.run_target or '—')}</code>")
     L.append(f"⏱ Chalte hue: <b>{_dur(el)}</b>")
     L.append(f"🔢 Kul tries: <b>{total}</b>" + (f"  (~{total / max(el / 60, 1/60):.1f}/min)" if el > 5 else ""))
-    L.append(f"⚙️ Gap: {gap_s()}s (+/- {db.get('jitter_pct')}% random)")
+    L.append(f"⚙️ Gap: {gap_s()}s (+/- {db.get('jitter_pct')}% random) | har account min {db.get('acct_gap_s')}s")
     if running and not engine.winner and engine.next_at:
         order = [live[(engine.next_idx + k) % len(live)] for k in range(len(live))]
         nxt_acc = next((x for x in order if not x.dead and x.paused_until <= engine.now()), None)
@@ -172,6 +172,7 @@ def settings_view(adv=False):
             "⚙️ <b>Settings</b>\n\n"
             f"🎯 Target: <code>@{html.escape(g('target') or '—')}</code>\n"
             f"⏱ Gap: <b>{gap_s()} second</b> (+/- {g('jitter_pct')}% random)\n"
+            f"⏳ Har account kam se kam <b>{g('acct_gap_s')} s</b> baad hi dobara try karega\n"
             "Accounts baari-baari se chalte hain, har try ke beech itna gap.\n\n"
             "Chalane ke liye: <code>/set @username</code>   Rokne ke liye: /stop"
         )
@@ -186,6 +187,7 @@ def settings_view(adv=False):
         "🔧 <b>Advanced settings</b>\n\n"
         f"🎯 Target: <code>@{html.escape(g('target') or '—')}</code>\n"
         f"⏱ Gap: <b>{gap_s()} second</b> (do tries ke beech, accounts baari-baari)\n"
+        f"⏳ Har account ka min gap: <b>{g('acct_gap_s')} s</b> (compulsory, isse pehle wo account dobara try nahi karega)\n"
         f"🎲 Random: <b>+/- {g('jitter_pct')}%</b> (gap me thoda upar-neeche, 0 = fixed)\n"
         f"🔢 Max attempts/account: <b>{g('max_att')}</b> (0 = unlimited)\n"
         f"🔔 FloodWait notify: <b>{'ON' if g('notify') == '1' else 'OFF'}</b>"
@@ -193,6 +195,7 @@ def settings_view(adv=False):
     rows = [
         [("🎯 Target", "edit:target")],
         [("➖0.1s", "adj:gap_ms:-100"), ("⏱ Gap ✏️", "edit:gap_ms"), ("➕0.1s", "adj:gap_ms:100")],
+        [("➖5", "adj:acct_gap_s:-5"), ("⏳ Account gap ✏️", "edit:acct_gap_s"), ("➕5", "adj:acct_gap_s:5")],
         [("➖5", "adj:jitter_pct:-5"), ("🎲 Random % ✏️", "edit:jitter_pct"), ("➕5", "adj:jitter_pct:5")],
         [("➖10", "adj:max_att:-10"), ("🔢 Max ✏️", "edit:max_att"), ("➕10", "adj:max_att:10")],
         [(f"🔔 Notify: {'ON' if g('notify') == '1' else 'OFF'}", "tog:notify")],
@@ -326,7 +329,7 @@ async def cb_settings_adv(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("adj:"))
 async def cb_adj(c: CallbackQuery):
     _, key, delta = c.data.split(":")[:3]
-    floor = {"gap_ms": 1, "max_att": 0, "jitter_pct": 0}[key]
+    floor = {"gap_ms": 1, "max_att": 0, "jitter_pct": 0, "acct_gap_s": 0}[key]
     val = max(floor, db.int(key) + int(delta))
     db.set(key, min(val, 50) if key == "jitter_pct" else val)
     await screen_settings(c, key != "gap_ms")
@@ -344,6 +347,7 @@ PROMPTS = {
              "Dusre din ke liye: <code>DD-MM-YYYY HH:MM:SS</code>",
     "gap_ms": "⏱ Gap <b>seconds</b> me bhejo (jaise <code>2</code> ya <code>0.5</code>):",
     "max_att": "🔢 Max attempts per account bhejo (0 = unlimited):",
+    "acct_gap_s": "⏳ Har account ke 2 tries ke beech kam se kam kitne <b>second</b> (jaise 10):",
     "jitter_pct": "🎲 Random % bhejo (0-50). Jaise 20 = 10s gap me 8-12s:",
 }
 
@@ -380,7 +384,7 @@ async def on_edit(m: Message, state: FSMContext):
             return await m.answer("❌ Sahi number bhejo:")
     db.set(key, v)
     await state.clear()
-    await screen_settings(m, key in ("max_att", "jitter_pct"))
+    await screen_settings(m, key in ("max_att", "jitter_pct", "acct_gap_s"))
 
 
 # ----- accounts -----

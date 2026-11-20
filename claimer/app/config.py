@@ -48,6 +48,8 @@ DEFAULTS = {
     "max_att": "0",    # per account max attempts (0 = unlimited)
     "lead_s": "15",    # schedule se kitna pehle accounts ready karne hain
     "notify": "1",
+    "acct_gap_s": "10",  # har account ke 2 tries ke beech kam se kam itne second (compulsory)
+    "channel_prefix": "p",  # bot sirf aisi public channel use karega jiska username isse shuru ho (khaali = koi bhi public/auto banao)
     "jitter_pct": "20", # gap me +/- itna % random (10s gap -> 8-12s). 0 = bilkul fixed
     "armed_forever": "",
 }
