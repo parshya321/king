@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import random
 import re
 import secrets
 import time
@@ -163,11 +164,12 @@ class Engine:
         v = self.db.get("armed_epoch", "")
         return float(v) if v else None
 
-    def arm(self, epoch: float):
+    def arm(self, epoch: float, forever: bool = False):
         self.disarm_task()
         self.db.set("armed_epoch", epoch)
+        self.db.set("armed_forever", "1" if forever else "")
         self.stop = asyncio.Event()
-        self.task = asyncio.create_task(self._run(epoch))
+        self.task = asyncio.create_task(self._run(epoch, forever))
         self.phase = "armed"
 
     def disarm_task(self):
@@ -177,6 +179,7 @@ class Engine:
         self.task = None
         self.phase = "idle"
         self.db.set("armed_epoch", "")
+        self.db.set("armed_forever", "")
 
     @property
     def busy(self):
@@ -214,7 +217,7 @@ class Engine:
                 self.offset = 0.0
         return stats
 
-    async def _run(self, epoch: float):
+    async def _run(self, epoch: float, forever: bool = False):
         try:
             lead = self.db.int("lead_s")
             self.phase = "armed"
@@ -228,7 +231,7 @@ class Engine:
                               f"<b>{fmt_ts(epoch)} IST</b> se shuru honge (clock offset {self.offset * 1000:+.0f}ms).")
             await self._sleep_until(epoch)
             self.phase = "running"
-            await self._attack(stats, epoch)
+            await self._attack(stats, epoch, forever)
         except asyncio.CancelledError:
             await self.notify("⏹ Job stop kar diya.")
             raise
@@ -238,18 +241,20 @@ class Engine:
         finally:
             self.phase = "idle"
             self.db.set("armed_epoch", "")
+            self.db.set("armed_forever", "")
 
-    async def _attack(self, stats: list[Stat], epoch: float):
+    async def _attack(self, stats: list[Stat], epoch: float, forever: bool = False):
         target = self.db.get("target")
         gap = max(self.db.int("gap_ms"), 1) / 1000
-        end = epoch + self.db.int("window_s")
+        end = float("inf") if forever else epoch + self.db.int("window_s")
+        jit = min(max(self.db.int("jitter_pct"), 0), 90) / 100
         max_att = self.db.int("max_att")
         self.winner = None
         self.stop = asyncio.Event()
         n = len(stats)
         started = self.now()
         await asyncio.gather(*(
-            self._worker(st, epoch + gap * i / n, gap, end, max_att, target)
+            self._worker(st, epoch + gap * i / n, gap, end, max_att, target, jit)
             for i, st in enumerate(stats)
         ))
         finished = self.now()
@@ -260,7 +265,7 @@ class Engine:
             kb = [[("👤 Profile username pe lagao", f"mv:{self.winner.acc['id']}")]]
         await self.notify(report, kb)
 
-    async def _worker(self, st: Stat, first_at, gap, end, max_att, target):
+    async def _worker(self, st: Stat, first_at, gap, end, max_att, target, jit=0.0):
         nxt = first_at
         tasks = []
         while not self.stop.is_set() and not st.dead:
@@ -279,7 +284,7 @@ class Engine:
             if st.inflight < 4:
                 st.attempts += 1
                 tasks.append(asyncio.create_task(self._attempt(st, target)))
-            nxt += gap
+            nxt += gap * random.uniform(1 - jit, 1 + jit)  # thoda random gap: har try ek jaise fasle par nahi
             if nxt < t - gap:  # peeche reh gaye to burst nahi
                 nxt = t + gap
             await asyncio.sleep(0)
@@ -329,7 +334,7 @@ class Engine:
             "",
             f"🕒 Schedule: {fmt_ts(epoch)} IST",
             f"▶️ Shuru: {fmt_ts(started)} | ⏹ Khatam: {fmt_ts(finished)}",
-            f"⏱ Duration: {finished - epoch:.2f}s | Gap: {self.db.get('gap_ms')}ms",
+            f"⏱ Duration: {finished - epoch:.2f}s | Gap: {self.db.int('gap_ms') / 1000:g}s",
             f"🔁 Total attempts: <b>{total}</b> ({len(stats)} account)",
         ]
         if ok:

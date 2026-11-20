@@ -26,7 +26,10 @@ async def main():
 
     # Redeploy ke baad armed job wapas chalu
     ep = engine.armed_epoch()
-    if ep:
+    if ep and db.get("armed_forever") == "1":
+        engine.arm(time.time(), forever=True)
+        await notify("♻️ Redeploy ke baad job wapas chalu ho gaya (target " f"@{db.get('target')}).")
+    elif ep:
         if time.time() < ep + db.int("window_s"):
             engine.arm(ep)
             await notify("♻️ Redeploy ke baad armed job restore ho gaya.")

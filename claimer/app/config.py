@@ -48,4 +48,6 @@ DEFAULTS = {
     "max_att": "0",    # per account max attempts (0 = unlimited)
     "lead_s": "15",    # schedule se kitna pehle accounts ready karne hain
     "notify": "1",
+    "jitter_pct": "30", # gap me +/- itna % random (0 = bilkul fixed gap)
+    "armed_forever": "",
 }

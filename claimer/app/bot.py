@@ -38,8 +38,8 @@ def kb(rows) -> InlineKeyboardMarkup:
 
 MAIN_KB = kb([
     [("👤 Accounts", "acc:list"), ("⚙️ Settings", "set:menu")],
-    [("▶️ Arm (schedule pe)", "job:arm"), ("⚡ Abhi chalao", "job:now")],
-    [("⏹ Stop", "job:stop"), ("📡 Status", "m:status")],
+    [("⚡ Start", "job:now"), ("⏹ Stop", "job:stop")],
+    [("📡 Status", "m:status")],
     [("📊 Last report", "rep:last")],
 ])
 BACK = [("⬅️ Menu", "m:main")]
@@ -107,32 +107,47 @@ def status_text() -> str:
     return "\n".join(lines)
 
 
-def settings_view():
+def gap_s() -> str:
+    return f"{db.int('gap_ms') / 1000:g}"
+
+
+def settings_view(adv=False):
     g = db.get
+    if not adv:  # simple screen: sirf Target, Time, Gap (seconds me)
+        text = (
+            "⚙️ <b>Settings</b>\n\n"
+            f"🎯 Target: <code>@{html.escape(g('target') or '—')}</code>\n"
+            f"⏱ Gap: <b>{gap_s()} second</b> (+/- {g('jitter_pct')}% random)\n\n"
+            "Chalane ke liye: <code>/set @username</code>   Rokne ke liye: /stop"
+        )
+        rows = [
+            [("🎯 Target", "edit:target")],
+            [("➖0.1s", "adj:gap_ms:-100"), ("⏱ Gap ✏️", "edit:gap_ms"), ("➕0.1s", "adj:gap_ms:100")],
+            [("🔧 Advanced", "set:adv")],
+            BACK,
+        ]
+        return text, kb(rows)
     text = (
-        "⚙️ <b>Settings</b>\n\n"
+        "🔧 <b>Advanced settings</b>\n\n"
         f"🎯 Target: <code>@{html.escape(g('target') or '—')}</code>\n"
-        f"🕒 Time (IST): <code>{html.escape(g('sched') or '—')}</code>\n"
-        f"⏱ Gap: <b>{g('gap_ms')} ms</b> (har account ke 2 tries ke beech)\n"
-        f"🪟 Window: <b>{g('window_s')} s</b> (schedule ke baad itni der try)\n"
+        f"⏱ Gap: <b>{gap_s()} second</b> (har account ke 2 tries ke beech)\n"
+        f"🎲 Random: <b>+/- {g('jitter_pct')}%</b> (gap me thoda upar-neeche, 0 = fixed)\n"
         f"🔢 Max attempts/account: <b>{g('max_att')}</b> (0 = unlimited)\n"
-        f"🚀 Lead: <b>{g('lead_s')} s</b> (schedule se itna pehle accounts ready)\n"
         f"🔔 FloodWait notify: <b>{'ON' if g('notify') == '1' else 'OFF'}</b>"
     )
     rows = [
-        [("🎯 Target", "edit:target"), ("🕒 Time", "edit:sched")],
-        [("➖50", "adj:gap_ms:-50"), ("⏱ Gap ✏️", "edit:gap_ms"), ("➕50", "adj:gap_ms:50")],
-        [("➖15", "adj:window_s:-15"), ("🪟 Window ✏️", "edit:window_s"), ("➕15", "adj:window_s:15")],
+        [("🎯 Target", "edit:target")],
+        [("➖0.1s", "adj:gap_ms:-100"), ("⏱ Gap ✏️", "edit:gap_ms"), ("➕0.1s", "adj:gap_ms:100")],
+        [("➖5", "adj:jitter_pct:-5"), ("🎲 Random % ✏️", "edit:jitter_pct"), ("➕5", "adj:jitter_pct:5")],
         [("➖10", "adj:max_att:-10"), ("🔢 Max ✏️", "edit:max_att"), ("➕10", "adj:max_att:10")],
-        [("➖5", "adj:lead_s:-5"), ("🚀 Lead ✏️", "edit:lead_s"), ("➕5", "adj:lead_s:5")],
         [(f"🔔 Notify: {'ON' if g('notify') == '1' else 'OFF'}", "tog:notify")],
-        BACK,
+        [("⬅️ Simple settings", "set:menu")],
     ]
     return text, kb(rows)
 
 
-async def screen_settings(ev):
-    t, m = settings_view()
+async def screen_settings(ev, adv=False):
+    t, m = settings_view(adv)
     await show(ev, t, m)
 
 
@@ -206,9 +221,17 @@ async def cmd_stop(m: Message):
     await do_stop(m)
 
 
-@router.message(Command("arm"))
-async def cmd_arm(m: Message):
-    await do_arm(m, now=False)
+@router.message(Command("set"))
+async def cmd_set(m: Message):
+    """/set @username : target set karke turant try karna shuru (/stop tak ya mil jane tak)"""
+    parts = (m.text or "").split(maxsplit=1)
+    name = parts[1].strip().lstrip("@") if len(parts) > 1 else ""
+    if not USERNAME_RE.match(name):
+        return await m.answer("Aise bhejo: <code>/set @username</code>\n(letter se shuru, 5-32 chars: a-z, 0-9, _)")
+    if engine.busy:
+        return await m.answer("⚠️ Job pehle se chal raha hai. Pehle /stop karo, phir /set.")
+    db.set("target", name)
+    await do_start(m)
 
 
 # ---------- callbacks ----------
@@ -229,12 +252,19 @@ async def cb_settings(c: CallbackQuery, state: FSMContext):
     await screen_settings(c)
 
 
+@router.callback_query(F.data == "set:adv")
+async def cb_settings_adv(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await screen_settings(c, True)
+
+
 @router.callback_query(F.data.startswith("adj:"))
 async def cb_adj(c: CallbackQuery):
-    _, key, delta = c.data.split(":")
-    floor = {"gap_ms": 1, "window_s": 1, "max_att": 0, "lead_s": 0}[key]
-    db.set(key, max(floor, db.int(key) + int(delta)))
-    await screen_settings(c)
+    _, key, delta = c.data.split(":")[:3]
+    floor = {"gap_ms": 1, "max_att": 0, "jitter_pct": 0}[key]
+    val = max(floor, db.int(key) + int(delta))
+    db.set(key, min(val, 90) if key == "jitter_pct" else val)
+    await screen_settings(c, key != "gap_ms")
 
 
 @router.callback_query(F.data == "tog:notify")
@@ -247,10 +277,9 @@ PROMPTS = {
     "target": "🎯 Target username bhejo (bina @, 5-32 chars):",
     "sched": "🕒 Time (IST) bhejo.\nFormat: <code>HH:MM:SS</code> ya <code>HH:MM:SS.mmm</code>\n"
              "Dusre din ke liye: <code>DD-MM-YYYY HH:MM:SS</code>",
-    "gap_ms": "⏱ Gap milliseconds me bhejo (jaise 500):",
-    "window_s": "🪟 Window seconds me bhejo (jaise 120):",
+    "gap_ms": "⏱ Gap <b>seconds</b> me bhejo (jaise <code>2</code> ya <code>0.5</code>):",
     "max_att": "🔢 Max attempts per account bhejo (0 = unlimited):",
-    "lead_s": "🚀 Lead seconds bhejo (jaise 15):",
+    "jitter_pct": "🎲 Random % bhejo (0-90, jaise 30 = gap me +/-30%):",
 }
 
 
@@ -273,12 +302,20 @@ async def on_edit(m: Message, state: FSMContext):
     elif key == "sched":
         if not parse_sched(v):
             return await m.answer("❌ Format galat. Jaise <code>14:30:00</code>. Dobara bhejo:")
+    elif key == "gap_ms":  # user seconds bhejta hai (decimal ok), andar milliseconds me save
+        try:
+            sec = float(v.replace(",", ".").lower().rstrip("s").strip())
+        except ValueError:
+            return await m.answer("❌ Seconds me number bhejo, jaise <code>2</code> ya <code>0.5</code>:")
+        if not (0.001 <= sec <= 3600):
+            return await m.answer("❌ 0.001 se 3600 second ke beech bhejo:")
+        v = str(int(round(sec * 1000)))
     else:
-        if not v.isdigit() or (key != "max_att" and int(v) < 1):
+        if not v.isdigit() or (key == "jitter_pct" and int(v) > 90):
             return await m.answer("❌ Sahi number bhejo:")
     db.set(key, v)
     await state.clear()
-    await screen_settings(m)
+    await screen_settings(m, key in ("max_att", "jitter_pct"))
 
 
 # ----- accounts -----
@@ -430,23 +467,17 @@ async def on_pwd(m: Message, state: FSMContext):
 
 
 # ----- job -----
-async def do_arm(ev, now: bool):
+async def do_start(ev):
     if not db.get("target"):
         return await show(ev, "❌ Pehle Settings me Target username set karo.", kb([BACK]))
     if not db.accounts(only_active=True):
         return await show(ev, "❌ Koi active account nahi. Pehle account add karo.", kb([BACK]))
     if engine.busy:
-        return await show(ev, "⚠️ Job pehle se armed/chal raha hai. Pehle Stop karo.", kb([BACK]))
-    if now:
-        epoch = time.time()
-    else:
-        epoch = sched_epoch(db.get("sched"))
-        if not epoch:
-            return await show(ev, "❌ Pehle Settings me Time set karo.", kb([BACK]))
-    engine.arm(epoch)
-    await show(ev, f"🟢 <b>Armed</b>\nTarget: <code>@{db.get('target')}</code>\n"
-                   f"Shuru: <b>{fmt_ts(epoch)} IST</b> ({max(0, epoch - time.time()):.0f}s baad)\n"
-                   f"Gap: {db.get('gap_ms')}ms | Window: {db.get('window_s')}s",
+        return await show(ev, "⚠️ Job pehle se chal raha hai. Pehle Stop karo.", kb([BACK]))
+    engine.arm(time.time(), forever=True)
+    await show(ev, f"🟢 <b>Chalu</b>\nTarget: <code>@{db.get('target')}</code>\n"
+                   f"Gap: {gap_s()}s (+/- {db.get('jitter_pct')}% random)\n"
+                   "Username milne ya /stop tak try chalta rahega.",
                kb([[("⏹ Stop", "job:stop")], BACK]))
 
 
@@ -457,14 +488,9 @@ async def do_stop(ev):
     await show(ev, "⏹ Stop ho gaya.", kb([BACK]))
 
 
-@router.callback_query(F.data == "job:arm")
-async def cb_arm(c: CallbackQuery):
-    await do_arm(c, now=False)
-
-
 @router.callback_query(F.data == "job:now")
 async def cb_now(c: CallbackQuery):
-    await do_arm(c, now=True)
+    await do_start(c)
 
 
 @router.callback_query(F.data == "job:stop")
