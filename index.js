@@ -92,7 +92,9 @@ async function get(url, tries = 4) {
 /* ------------------------------------------------------------------ */
 /* Telegram bot: alerts + commands (/status /errors /review /new ...)  */
 /* ------------------------------------------------------------------ */
-const TG_TOKEN = process.env.TG_BOT_TOKEN || '';
+// TG_BOT_TOKEN me ek ya zyada bot token (comma se alag): har bot pe alert aata hai aur har bot ke commands chalte hain
+const TG_TOKENS = String(process.env.TG_BOT_TOKEN || '').split(/[\s,]+/).filter(Boolean);
+const TG_TOKEN = TG_TOKENS[0] || '';
 const TG_CHAT = String(process.env.TG_CHAT_ID || '').trim();
 const REPORT_MIN = +process.env.REPORT_MINUTES || 30;
 const stats = { linkChanges: {}, lastRefreshAt: 0, startedAt: Date.now(), phase: 'start', lastSync: null, lastDeep: null, pendingErr: [], errorsTotal: 0, harvested: 0, firstRunDone: false, forceDeep: false };
@@ -104,17 +106,20 @@ const nap = (ms) => new Promise((res) => {
 });
 const wake = () => { if (wakeFn) wakeFn(); };
 
-async function tgApi(method, payload) {
-  const r = await http().post(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, payload || {}, { timeout: 40000 });
+async function tgApi(method, payload, token) {
+  const r = await http().post(`https://api.telegram.org/bot${token || TG_TOKEN}/${method}`, payload || {}, { timeout: 40000 });
   return JSON.parse(r.data);
 }
-async function tgSend(text, chat) {
+// token diya to sirf us bot se (command ka jawab); nahi diya to saare bots se (alerts)
+async function tgSend(text, chat, token) {
   const to = chat || TG_CHAT;
-  if (!TG_TOKEN || !to) return;
+  if (!TG_TOKENS.length || !to) return;
   const s = String(text);
-  for (let i = 0; i < s.length; i += 3800) {
-    try { await tgApi('sendMessage', { chat_id: to, text: s.slice(i, i + 3800), disable_web_page_preview: true }); }
-    catch (e) { log('telegram send failed:', e.message); }
+  for (const tk of (token ? [token] : TG_TOKENS)) {
+    for (let i = 0; i < s.length; i += 3800) {
+      try { await tgApi('sendMessage', { chat_id: to, text: s.slice(i, i + 3800), disable_web_page_preview: true }, tk); }
+      catch (e) { log('telegram send failed:', e.message); }
+    }
   }
 }
 const notify = (text) => tgSend(text);
@@ -209,13 +214,14 @@ const HELP = [
   '/id       Show this chat ID',
 ].join('\n');
 
-async function handleCommand(db, text, chatId) {
+async function handleCommand(db, text, chatId, token) {
+  const reply = (t, c) => tgSend(t, c, token);
   const cmd = text.trim().split(/\s+/)[0].toLowerCase().replace(/@.*$/, '');
   const T = db.collection('titles'), E = db.collection('episodes');
-  if (cmd === '/start' || cmd === '/help') return tgSend(HELP, chatId);
-  if (cmd === '/id') return tgSend(`Chat ID: ${chatId}`, chatId);
-  if (cmd === '/status') return tgSend(await statusText(db), chatId);
-  if (cmd === '/audit') return tgSend(await auditText(db), chatId);
+  if (cmd === '/start' || cmd === '/help') return reply(HELP, chatId);
+  if (cmd === '/id') return reply(`Chat ID: ${chatId}`, chatId);
+  if (cmd === '/status') return reply(await statusText(db), chatId);
+  if (cmd === '/audit') return reply(await auditText(db), chatId);
   if (cmd === '/wawtest') {
     // watchanimeworld: sirf ek normal request se check (retry nahi). /wawtest <series url> (default FMAB)
     const url = text.trim().split(/\s+/)[1] || 'https://watchanimeworld.one/series/fullmetal-alchemist-brotherhood/';
@@ -223,12 +229,12 @@ async function handleCommand(db, text, chatId) {
     try {
       msg = await require('./waw').probe(async (u) => { const r = await http().get(u, { headers: extraHeaders(u), validateStatus: () => true }); return { status: r.status, body: String(r.data) }; }, url);
     } catch (e) { msg = 'wawtest error: ' + e.message; }
-    return tgSend('🌐 WAW TEST\n' + msg, chatId);
+    return reply('🌐 WAW TEST\n' + msg, chatId);
   }
   if (cmd === '/manga') {
     let text;
     try { text = await require('./manga').statusText(); } catch (e) { text = '📚 Manga worker is not running (' + e.message + ').'; }
-    return tgSend(text, chatId);
+    return reply(text, chatId);
   }
   if (cmd === '/titles') {
     // hamare saare titles ki list ek .txt file mein (type | slug | naam | languages)
@@ -242,9 +248,9 @@ async function handleCommand(db, text, chatId) {
       fd.append('chat_id', String(chatId));
       fd.append('caption', `📄 Anime catalog: ${lines.length} titles\nFormat: type | slug | title | languages`);
       fd.append('document', new Blob([lines.join('\n')], { type: 'text/plain' }), 'our_titles.txt');
-      const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendDocument`, { method: 'POST', body: fd });
-      if (!r.ok) return tgSend('❌ Could not send the file (HTTP ' + r.status + ').', chatId);
-    } catch (e) { return tgSend('❌ Could not send the file: ' + e.message, chatId); }
+      const r = await fetch(`https://api.telegram.org/bot${token || TG_TOKEN}/sendDocument`, { method: 'POST', body: fd });
+      if (!r.ok) return reply('❌ Could not send the file (HTTP ' + r.status + ').', chatId);
+    } catch (e) { return reply('❌ Could not send the file: ' + e.message, chatId); }
     return;
   }
   if (cmd === '/errors') {
@@ -252,62 +258,62 @@ async function handleCommand(db, text, chatId) {
     const by = await db.collection('errors').aggregate([{ $match: { ts: { $gte: new Date(Date.now() - 86400000) } } }, { $group: { _id: '$kind', n: { $sum: 1 } } }]).toArray();
     const head = by.length ? by.map((x) => `${x._id}: ${x.n}`).join(', ') : 'none';
     const body = last.map((e) => `${e.ts.toISOString().slice(11, 16)} ${e.kind} ${e.id}\n   ${e.message.slice(0, 110)}`).join('\n');
-    return tgSend(`⚠️ ERRORS | LAST 24 HOURS\nBy type: ${head}\n\n${body || '✅ No errors.'}`, chatId);
+    return reply(`⚠️ ERRORS | LAST 24 HOURS\nBy type: ${head}\n\n${body || '✅ No errors.'}`, chatId);
   }
   if (cmd === '/review') {
     const n = await T.countDocuments({ status: 'done', live: false });
     const list = await T.find({ status: 'done', live: false }).sort({ verified_at: -1 }).limit(15).toArray();
     const body = list.map((t) => `${t.type}:${t.slug}\n   ${(t.errors || []).join(', ').slice(0, 120)}`).join('\n');
-    return tgSend(`🔴 NEEDS REVIEW: ${n} title${n === 1 ? '' : 's'}\n\n${body || '✅ Everything passed verification.'}`, chatId);
+    return reply(`🔴 NEEDS REVIEW: ${n} title${n === 1 ? '' : 's'}\n\n${body || '✅ Everything passed verification.'}`, chatId);
   }
   if (cmd === '/new') {
     const list = await T.find({}).sort({ first_seen: -1 }).limit(10).toArray();
     const ch = await E.find({ link_changed_at: { $exists: true } }).sort({ link_changed_at: -1 }).limit(5).toArray();
-    return tgSend(`🆕 NEWEST TITLES\n${list.map((t) => `• ${t.title || t.slug} (${t.type}, ${t.status})`).join('\n')}\n\n🔁 RECENTLY CHANGED LINKS\n${ch.map((e) => `• ${e._id}`).join('\n') || 'None'}`, chatId);
+    return reply(`🆕 NEWEST TITLES\n${list.map((t) => `• ${t.title || t.slug} (${t.type}, ${t.status})`).join('\n')}\n\n🔁 RECENTLY CHANGED LINKS\n${ch.map((e) => `• ${e._id}`).join('\n') || 'None'}`, chatId);
   }
   if (cmd === '/discover') {
     stats.forceDeep = true; wake();
-    return tgSend('🔎 Deep discovery queued. It starts as soon as the current run finishes.', chatId);
+    return reply('🔎 Deep discovery queued. It starts as soon as the current run finishes.', chatId);
   }
   if (cmd === '/refresh') {
     // ek title ke saare links site se dobara padho: /refresh boruto-naruto-next-generations  (ya poora link)
     let arg = (text.trim().split(/\s+/)[1] || '').trim();
     const m = arg.match(/\/(series|movies|episode)\/([^/?#]+)/);
     if (m) arg = m[1] === 'episode' ? m[2].replace(/-\d+x\d+$/, '') : m[2];
-    if (!arg) return tgSend('Usage: /refresh <slug or link>\nExample: /refresh boruto-naruto-next-generations', chatId);
+    if (!arg) return reply('Usage: /refresh <slug or link>\nExample: /refresh boruto-naruto-next-generations', chatId);
     const t = await T.findOne({ slug: arg });
-    if (!t) return tgSend(`❌ No title found for "${arg}".`, chatId);
+    if (!t) return reply(`❌ No title found for "${arg}".`, chatId);
     await T.updateOne({ _id: t._id }, { $set: { needs_refresh: true, attempts: 0 } });
     const e = await E.updateMany({ series_slug: t.slug }, { $set: { scraped: false, attempts: 0 } });
     wake();
-    return tgSend(`🔄 Refresh queued: ${t.title || t.slug}\nEpisodes to re-check: ${e.modifiedCount}. New links will be live in a few minutes.`, chatId);
+    return reply(`🔄 Refresh queued: ${t.title || t.slug}\nEpisodes to re-check: ${e.modifiedCount}. New links will be live in a few minutes.`, chatId);
   }
   if (cmd === '/retry') {
     const a = await E.updateMany({ scraped: false, attempts: { $gte: MAX_ATTEMPTS } }, { $set: { attempts: 0 } });
     const b = await T.updateMany({ status: 'error' }, { $set: { attempts: 0 } });
     wake();
-    return tgSend(`🔁 Retry queued: ${a.modifiedCount} episodes, ${b.modifiedCount} titles.`, chatId);
+    return reply(`🔁 Retry queued: ${a.modifiedCount} episodes, ${b.modifiedCount} titles.`, chatId);
   }
-  return tgSend('Unknown command. Send /help to see all commands.', chatId);
+  return reply('Unknown command. Send /help to see all commands.', chatId);
 }
 
-async function tgLoop(db) {
+async function tgLoop(db, token) {
   let offset = 0;
   log('telegram bot sun raha hai');
   for (;;) {
     try {
-      const r = await tgApi('getUpdates', { timeout: 25, offset, allowed_updates: ['message'] });
+      const r = await tgApi('getUpdates', { timeout: 25, offset, allowed_updates: ['message'] }, token);
       for (const u of r.result || []) {
         offset = u.update_id + 1;
         const m = u.message;
         if (!m || !m.text) continue;
         const chatId = String(m.chat.id);
         if (!TG_CHAT) { // TG_CHAT_ID abhi set nahi: sirf chat ID bata do
-          if (/^\/(id|start)/i.test(m.text)) await tgSend(`Your chat ID: ${chatId}\nAdd it to Railway Variables as TG_CHAT_ID and redeploy.`, chatId);
+          if (/^\/(id|start)/i.test(m.text)) await tgSend(`Your chat ID: ${chatId}\nAdd it to Railway Variables as TG_CHAT_ID and redeploy.`, chatId, token);
           continue;
         }
         if (chatId !== TG_CHAT) continue; // koi aur bot use na kar sake
-        try { await handleCommand(db, m.text, chatId); } catch (e) { await tgSend('❌ Command failed: ' + e.message, chatId); }
+        try { await handleCommand(db, m.text, chatId, token); } catch (e) { await tgSend('❌ Command failed: ' + e.message, chatId, token); }
       }
     } catch (e) {
       const st = e.response && e.response.status;
@@ -1191,7 +1197,7 @@ async function main() {
 
   // MODE=run
   if (TG_TOKEN) {
-    tgLoop(db).catch((e) => log('tgLoop band:', e.message));
+    for (const tk of TG_TOKENS) tgLoop(db, tk).catch((e) => log('tgLoop band:', e.message));
     reporterLoop(db).catch((e) => log('reporterLoop band:', e.message));
     await tgSend(`🚀 Anime scraper started (database: ${DB_NAME}).\nSend /help for commands.`);
   } else {

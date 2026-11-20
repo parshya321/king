@@ -41,7 +41,8 @@ const DELAY_MS = +env('DELAY_MS', 300);
 const WATCH_MINUTES = +env('WATCH_MINUTES', 60);
 const REPORT_MINUTES = +env('REPORT_MINUTES', 60);
 const MAX_WALK = +env('MAX_WALK', 3000);
-const TG_TOKEN = env('TG_BOT_TOKEN', '');
+const TG_TOKENS = String(env('TG_BOT_TOKEN', '')).split(/[\s,]+/).filter(Boolean);
+const TG_TOKEN = TG_TOKENS[0] || '';
 const TG_CHAT = env('TG_CHAT_ID', '');
 const ADULT = new Set(String(env('ADULT_GENRES', 'Mature,Sexual Violence,Smut,Hentai,Adult')).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
 const UA = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36';
@@ -99,10 +100,12 @@ async function tg(text) {
   if (!TG_TOKEN || !TG_CHAT) return;
   const s = String(text);
   for (let i = 0; i < s.length; i += 3800) {
-    try {
-      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
-        { chat_id: TG_CHAT, text: s.slice(i, i + 3800), disable_web_page_preview: true }, { timeout: 20000 });
-    } catch (e) { log('telegram failed', e.message); }
+    for (const tk of TG_TOKENS) {
+      try {
+        await axios.post(`https://api.telegram.org/bot${tk}/sendMessage`,
+          { chat_id: TG_CHAT, text: s.slice(i, i + 3800), disable_web_page_preview: true }, { timeout: 20000 });
+      } catch (e) { log('telegram failed', e.message); }
+    }
   }
 }
 function noteError(kind, id, e) {
