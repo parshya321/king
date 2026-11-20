@@ -71,6 +71,7 @@ class Stat:
     win: float | None = None
     win_attempt: int = 0
     paused_until: float = 0.0
+    last_try: float | None = None
     inflight: int = 0
     dead: bool = False
 
@@ -89,6 +90,12 @@ class Engine:
         self.offset = 0.0
         self.winner: Stat | None = None
         self.phase = "idle"  # idle | armed | preparing | running
+        # live /stats ke liye
+        self.live: list[Stat] = []
+        self.run_target = ""
+        self.run_started = 0.0
+        self.next_at = 0.0
+        self.next_idx = 0
 
     def now(self) -> float:
         return time.time() + self.offset
@@ -96,7 +103,8 @@ class Engine:
     # ---------- clients / channels ----------
     @staticmethod
     def make_client(session: str = "") -> TelegramClient:
-        c = TelegramClient(StringSession(session), API_ID, API_HASH, request_retries=1)
+        c = TelegramClient(StringSession(session), API_ID, API_HASH, request_retries=1,
+                           receive_updates=False)  # updates ki zaroorat nahi: extra getDifference requests aur log shor band
         c.flood_sleep_threshold = 0  # FloodWait ko khud handle karenge, Telethon chup-chaap sleep na kare
         return c
 
@@ -247,11 +255,12 @@ class Engine:
         target = self.db.get("target")
         gap = max(self.db.int("gap_ms"), 1) / 1000
         end = float("inf") if forever else epoch + self.db.int("window_s")
-        jit = min(max(self.db.int("jitter_pct"), 0), 90) / 100
+        jit = min(max(self.db.int("jitter_pct"), 0), 50) / 100
         max_att = self.db.int("max_att")
         self.winner = None
         self.stop = asyncio.Event()
         started = self.now()
+        self.live, self.run_target, self.run_started = stats, target, time.time()
         await self._dispatch(stats, epoch, gap, end, max_att, target, jit)
         finished = self.now()
         report = self._report(stats, target, epoch, started, finished)
@@ -299,9 +308,12 @@ class Engine:
                 continue
             st = stats[pick]
             st.attempts += 1
+            st.last_try = time.time()
             tasks.append(asyncio.create_task(self._attempt(st, target)))
             idx = (pick + 1) % n
+            self.next_idx = idx
             nxt += gap * random.uniform(1 - jit, 1 + jit)  # thoda random: har try ek jaise fasle par nahi
+            self.next_at = nxt
             if nxt < t - gap:  # peeche reh gaye to burst nahi
                 nxt = t + gap
             tasks = [x for x in tasks if not x.done()]
@@ -324,8 +336,11 @@ class Engine:
             st.errors["FloodWait"] += 1
             st.floods.append((ts, e.seconds))
             st.paused_until = self.now() + e.seconds
+            req = type(getattr(e, "request", None)).__name__ if getattr(e, "request", None) is not None else "?"
             await self.notify(f"⏳ <b>FloodWait</b>: <code>{html.escape(st.label)}</code> par "
-                              f"<b>{e.seconds}s</b> ka flood wait laga ({fmt_ts(ts)}). Itni der ye account pause.")
+                              f"<b>{e.seconds}s</b> ka flood wait laga ({fmt_ts(ts)}), request: <code>{req}</code>, "
+                              f"is account ki try #{n + 1} par (sab accounts milake kul {sum(x.attempts for x in self.live)} tries ke baad). "
+                              f"Itni der ye account pause.")
         except errors.RPCError as e:
             name = type(e).__name__
             st.errors[name] += 1

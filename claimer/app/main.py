@@ -14,6 +14,7 @@ from .engine import Engine
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("telethon").setLevel(logging.WARNING)  # 'Got difference' jaisi shor wali lines band
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     db = DB(DB_PATH)
 

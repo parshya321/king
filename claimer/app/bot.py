@@ -39,7 +39,7 @@ def kb(rows) -> InlineKeyboardMarkup:
 MAIN_KB = kb([
     [("👤 Accounts", "acc:list"), ("⚙️ Settings", "set:menu")],
     [("⚡ Start", "job:now"), ("⏹ Stop", "job:stop")],
-    [("📡 Status", "m:status")],
+    [("📊 Stats", "m:stats"), ("📡 Status", "m:status")],
     [("📊 Last report", "rep:last")],
 ])
 BACK = [("⬅️ Menu", "m:main")]
@@ -105,6 +105,60 @@ def status_text() -> str:
     lines.append(f"Target: <code>@{html.escape(db.get('target') or '—')}</code>")
     lines.append(f"Accounts: {sum(1 for a in accs if a['active'])} active / {len(accs)} total")
     return "\n".join(lines)
+
+
+def _ago(ts) -> str:
+    if not ts:
+        return "—"
+    d = max(0, int(time.time() - ts))
+    return f"{d}s pehle" if d < 60 else f"{d // 60}m {d % 60}s pehle"
+
+
+def _dur(sec: float) -> str:
+    sec = int(max(0, sec))
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return (f"{h}h " if h else "") + (f"{m}m " if h or m else "") + f"{s}s"
+
+
+def stats_text() -> str:
+    live = engine.live
+    running = engine.busy and engine.phase in ("running", "preparing")
+    L = ["📊 <b>Stats</b>"]
+    if not live:
+        L.append("Abhi koi job nahi chala. <code>/set @username</code> se shuru karo.")
+        L.append(f"Accounts: {sum(1 for a in db.accounts() if a['active'])} active / {len(db.accounts())} total")
+        return "\n".join(L)
+    total = sum(s.attempts for s in live)
+    el = time.time() - engine.run_started if engine.run_started else 0
+    state = {"running": "🟢 Chal raha hai", "preparing": "🟡 Taiyari me", "armed": "🟡 Armed"}.get(engine.phase, "⚪ Ruka hua")
+    if engine.winner:
+        state = "🏆 Username mil gaya!"
+    L.append(f"{state}\n🎯 Username: <code>@{html.escape(engine.run_target or '—')}</code>")
+    L.append(f"⏱ Chalte hue: <b>{_dur(el)}</b>")
+    L.append(f"🔢 Kul tries: <b>{total}</b>" + (f"  (~{total / max(el / 60, 1/60):.1f}/min)" if el > 5 else ""))
+    L.append(f"⚙️ Gap: {gap_s()}s (+/- {db.get('jitter_pct')}% random)")
+    if running and not engine.winner and engine.next_at:
+        order = [live[(engine.next_idx + k) % len(live)] for k in range(len(live))]
+        nxt_acc = next((x for x in order if not x.dead and x.paused_until <= engine.now()), None)
+        if nxt_acc:
+            L.append(f"➡️ Agla try: <code>{html.escape(nxt_acc.label)}</code> se {max(0, engine.next_at - time.time()):.0f}s me")
+    L.append("")
+    now = time.time()
+    for s in live:
+        if s.dead:
+            st = "☠️ dead/logout"
+        elif s.paused_until > engine.now():
+            st = f"⏳ FloodWait ({int(s.paused_until - engine.now())}s baaki)"
+        else:
+            st = "✅ ready"
+        if engine.winner is s:
+            st = "🏆 jeeta"
+        errs = ", ".join(f"{k}×{v}" for k, v in s.errors.most_common(3)) or "—"
+        L.append(f"• <code>{html.escape(s.label)}</code> {st}\n"
+                 f"   tries: <b>{s.attempts}</b> | last: {_ago(s.last_try)} | floods: {len(s.floods)}\n"
+                 f"   errors: {html.escape(errs)}")
+    return "\n".join(L)
 
 
 def gap_s() -> str:
@@ -212,6 +266,11 @@ async def cmd_status(m: Message):
     await screen_status(m)
 
 
+@router.message(Command("stats"))
+async def cmd_stats(m: Message):
+    await m.answer(stats_text(), reply_markup=kb([[("🔄 Refresh", "m:stats")], BACK]))
+
+
 @router.message(Command("report"))
 async def cmd_report(m: Message):
     await m.answer(db.last_report() or "Abhi koi report nahi.", reply_markup=kb([BACK]))
@@ -242,6 +301,11 @@ async def cb_main(c: CallbackQuery, state: FSMContext):
     await screen_main(c)
 
 
+@router.callback_query(F.data == "m:stats")
+async def cb_stats(c: CallbackQuery):
+    await show(c, stats_text(), kb([[("🔄 Refresh", "m:stats")], BACK]))
+
+
 @router.callback_query(F.data == "m:status")
 async def cb_status(c: CallbackQuery):
     await screen_status(c)
@@ -264,7 +328,7 @@ async def cb_adj(c: CallbackQuery):
     _, key, delta = c.data.split(":")[:3]
     floor = {"gap_ms": 1, "max_att": 0, "jitter_pct": 0}[key]
     val = max(floor, db.int(key) + int(delta))
-    db.set(key, min(val, 90) if key == "jitter_pct" else val)
+    db.set(key, min(val, 50) if key == "jitter_pct" else val)
     await screen_settings(c, key != "gap_ms")
 
 
@@ -280,7 +344,7 @@ PROMPTS = {
              "Dusre din ke liye: <code>DD-MM-YYYY HH:MM:SS</code>",
     "gap_ms": "⏱ Gap <b>seconds</b> me bhejo (jaise <code>2</code> ya <code>0.5</code>):",
     "max_att": "🔢 Max attempts per account bhejo (0 = unlimited):",
-    "jitter_pct": "🎲 Random % bhejo (0-90, jaise 30 = gap me +/-30%):",
+    "jitter_pct": "🎲 Random % bhejo (0-50). Jaise 20 = 10s gap me 8-12s:",
 }
 
 
@@ -312,7 +376,7 @@ async def on_edit(m: Message, state: FSMContext):
             return await m.answer("❌ 0.001 se 3600 second ke beech bhejo:")
         v = str(int(round(sec * 1000)))
     else:
-        if not v.isdigit() or (key == "jitter_pct" and int(v) > 90):
+        if not v.isdigit() or (key == "jitter_pct" and int(v) > 50):
             return await m.answer("❌ Sahi number bhejo:")
     db.set(key, v)
     await state.clear()
