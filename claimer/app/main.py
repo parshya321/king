@@ -24,6 +24,7 @@ async def main():
     engine = Engine(db, notify)
     botmod.db = db
     botmod.engine = engine
+    asyncio.create_task(engine.start_all_listeners())  # OTP/login-code forward, sab accounts ke liye
 
     # Redeploy ke baad armed job wapas chalu
     ep = engine.armed_epoch()

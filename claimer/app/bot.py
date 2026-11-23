@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from telethon import errors
 
 from .config import API_HASH, API_ID, enc
+from .sessions import extract_candidates
 from .engine import Engine, fmt_ts, parse_sched, sched_epoch
 
 router = Router()
@@ -25,6 +26,7 @@ class S(StatesGroup):
     phone = State()
     code = State()
     pwd = State()
+    session_in = State()
     edit = State()
     chan = State()
 
@@ -212,7 +214,7 @@ async def screen_settings(ev, adv=False):
 async def screen_accounts(ev):
     accs = db.accounts()
     rows = [[(f"{'✅' if a['active'] else '⏸'} {a['name'] or a['phone']}", f"acc:{a['id']}")] for a in accs]
-    rows.append([("➕ Account add", "acc:add")])
+    rows.append([("📞 Phone se add", "acc:add"), ("📄 Session se add", "acc:addsession")])
     rows.append(BACK)
     await show(ev, f"👤 <b>Accounts</b> ({len(accs)})", kb(rows))
 
@@ -405,6 +407,7 @@ async def cb_acc_tog(c: CallbackQuery):
     a = db.account(aid)
     db.update_account(aid, active=0 if a["active"] else 1)
     await screen_account(c, aid)
+    # OTP forward active/paused dono accounts ke liye chalu rehta hai (login kabhi bhi lagana pad sakta hai)
 
 
 @router.callback_query(F.data.startswith("acc:del:"))
@@ -415,6 +418,7 @@ async def cb_acc_del(c: CallbackQuery):
         return await show(c, "Pakka remove karna hai? Session bhi delete ho jayega.",
                           kb([[("✅ Haan, delete", f"acc:del:{aid}:y"), ("❌ Nahi", f"acc:{aid}")]]))
     await engine.drop_client(aid)
+    await engine.stop_otp_listener(aid)
     db.delete_account(aid)
     await screen_accounts(c)
 
@@ -491,6 +495,76 @@ async def finish_login(m: Message, state: FSMContext, client, phone):
                             f"<b>{html.escape(ch.title)}</b> (<code>@{ch.username}</code>)")
     except Exception as e:
         await msg.edit_text(f"✅ Account add hua, par channel setup fail: {html.escape(str(e))}")
+    await engine.start_otp_listener(db.account(aid))
+    await screen_accounts(m)
+
+
+# ----- add account (session string / .session file / zip) -----
+@router.callback_query(F.data == "acc:addsession")
+async def cb_acc_addsession(c: CallbackQuery, state: FSMContext):
+    await state.set_state(S.session_in)
+    await show(c, "📄 Session string paste karo (ek ya kai lines me ek saath bhi), ya "
+                  "<code>.session</code> / <code>.zip</code> / <code>.txt</code> file bhejo "
+                  "(zip me kai sessions ek saath bhi chalega):",
+               kb([[("❌ Cancel", "acc:list")]]))
+
+
+@router.message(S.session_in)
+async def on_session_in(m: Message, state: FSMContext):
+    if m.document:
+        name = m.document.file_name or "file"
+        if m.document.file_size and m.document.file_size > 20 * 1024 * 1024:
+            return await m.answer("❌ File 20MB se badi hai. Chhota bhejo ya /menu:")
+        try:
+            f = await m.bot.get_file(m.document.file_id)
+            buf = await m.bot.download_file(f.file_path)
+            data = buf.read() if hasattr(buf, "read") else bytes(buf)
+        except Exception as e:
+            return await m.answer(f"❌ File download nahi hui: {html.escape(str(e))}\nDobara bhejo ya /menu:")
+    else:
+        name = "pasted.txt"
+        data = (m.text or "").encode("utf-8", "ignore")
+    try:
+        await m.delete()  # session string chat me na rahe
+    except Exception:
+        pass
+    cands = extract_candidates(name, data)
+    if not cands:
+        return await m.answer("❌ Isme koi valid session string/file nahi mila. Dobara bhejo ya /menu:")
+    status = await m.answer(f"🔍 {len(cands)} session mile, check kar raha hu...")
+    ok, fail = [], []
+    for label, sess in cands:
+        client = engine.make_client(sess)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                fail.append(f"{label}: session expired/logged out")
+                continue
+            me = await client.get_me()
+            name2 = " ".join(x for x in [me.first_name, me.last_name] if x) or (me.username or label)
+            aid = db.upsert_account(me.id, me.phone or "", name2, enc(client.session.save()))
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            fail.append(f"{label}: {html.escape(str(e))}")
+            continue
+        engine.adopt_client(aid, client)
+        try:
+            ch, how = await engine.ensure_channel(db.account(aid), client)
+            ok.append(f"{html.escape(name2)}: {how}")
+        except Exception as e:
+            ok.append(f"{html.escape(name2)}: add hua, channel setup fail ({html.escape(str(e))})")
+        await engine.start_otp_listener(db.account(aid))
+    await state.clear()
+    parts = []
+    if ok:
+        parts.append(f"✅ <b>{len(ok)} account add hue:</b>\n" + "\n".join(f"• {x}" for x in ok))
+    if fail:
+        parts.append(f"❌ <b>{len(fail)} fail:</b>\n" + "\n".join(f"• {x}" for x in fail))
+    await status.edit_text(("\n\n".join(parts) or "❌ Kuch nahi hua.")[:4000])
     await screen_accounts(m)
 
 

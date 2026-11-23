@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateUsernameRequest as AccUser
 from telethon.tl.functions.channels import CreateChannelRequest, GetAdminedPublicChannelsRequest
@@ -85,6 +85,7 @@ class Engine:
         self.db = db
         self.notify = notify  # async fn(text, kb=None)
         self.clients: dict[int, TelegramClient] = {}
+        self.listeners: dict[int, TelegramClient] = {}  # OTP forward ke liye, alag se (receive_updates=True)
         self.task: asyncio.Task | None = None
         self.stop = asyncio.Event()
         self.offset = 0.0
@@ -102,11 +103,65 @@ class Engine:
 
     # ---------- clients / channels ----------
     @staticmethod
-    def make_client(session: str = "") -> TelegramClient:
+    def make_client(session: str = "", listen: bool = False) -> TelegramClient:
+        # listen=False (claim ke waqt): updates band, extra getDifference requests aur log shor nahi.
+        # listen=True (OTP listener): updates chalu, taaki naye messages (login code) turant mil jayen.
         c = TelegramClient(StringSession(session), API_ID, API_HASH, request_retries=1,
-                           receive_updates=False)  # updates ki zaroorat nahi: extra getDifference requests aur log shor band
+                           receive_updates=listen)
         c.flood_sleep_threshold = 0  # FloodWait ko khud handle karenge, Telethon chup-chaap sleep na kare
         return c
+
+    # ---------- OTP / login-code forwarding ----------
+    # Har add kiye hue account ka ek "listener" client chalta rehta hai (job chale ya na chale).
+    # Telegram apne official "Telegram" service account (id 777000) se login code bhejta hai -
+    # wahi message yahan se turant admin ko forward ho jata hai.
+    async def _on_service_msg(self, label: str, event):
+        text = (event.raw_text or "").strip()
+        if not text:
+            return
+        m = re.search(r"\b(\d{4,8})\b", text)
+        extra = f"\n\n🔢 <b>Code:</b> <code>{m.group(1)}</code>" if m else ""
+        await self.notify(f"🔑 <b>{html.escape(label)}</b> ko Telegram se message aaya (login/OTP ho sakta hai):\n\n"
+                          f"{html.escape(text)}{extra}")
+
+    async def start_otp_listener(self, acc: dict):
+        aid = acc["id"]
+        if aid in self.listeners:
+            return
+        label = acc.get("phone") or acc.get("name") or str(aid)
+        try:
+            c = self.make_client(dec(acc["session"]), listen=True)
+            await c.connect()
+            if not await c.is_user_authorized():
+                await c.disconnect()
+                log.warning("listener: %s logged out, OTP forward band", label)
+                return
+        except Exception as e:
+            log.warning("listener connect fail for %s: %r", label, e)
+            return
+
+        async def handler(event):
+            try:
+                await self._on_service_msg(label, event)
+            except Exception as e:
+                log.warning("otp forward fail (%s): %r", label, e)
+
+        c.add_event_handler(handler, events.NewMessage(from_users=777000))
+        self.listeners[aid] = c
+        log.info("OTP listener started for %s", label)
+
+    async def stop_otp_listener(self, aid: int):
+        c = self.listeners.pop(aid, None)
+        if c:
+            try:
+                await c.disconnect()
+            except Exception:
+                pass
+
+    async def start_all_listeners(self):
+        """Startup par (aur redeploy ke baad) sab accounts ke liye OTP listener chalu karo."""
+        for acc in self.db.accounts():
+            await self.start_otp_listener(acc)
 
     async def client_for(self, acc: dict) -> TelegramClient:
         c = self.clients.get(acc["id"])
