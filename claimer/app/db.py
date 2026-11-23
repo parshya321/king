@@ -66,6 +66,11 @@ class DB:
             r = self.c.execute("SELECT * FROM accounts WHERE id=?", (aid,)).fetchone()
         return dict(r) if r else None
 
+    def account_by_tg(self, tg_id):
+        with self.lock:
+            r = self.c.execute("SELECT * FROM accounts WHERE tg_id=?", (tg_id,)).fetchone()
+        return dict(r) if r else None
+
     def update_account(self, aid, **kw):
         cols = ",".join(f"{k}=?" for k in kw)
         with self.lock:

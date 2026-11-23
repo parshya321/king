@@ -27,6 +27,7 @@ class S(StatesGroup):
     code = State()
     pwd = State()
     session_in = State()
+    pw_new = State()
     edit = State()
     chan = State()
 
@@ -215,6 +216,8 @@ async def screen_accounts(ev):
     accs = db.accounts()
     rows = [[(f"{'✅' if a['active'] else '⏸'} {a['name'] or a['phone']}", f"acc:{a['id']}")] for a in accs]
     rows.append([("📞 Add by phone", "acc:add"), ("📄 Add by session", "acc:addsession")])
+    if accs:
+        rows.append([("🔐 2FA", "acc:pwall")])
     rows.append(BACK)
     await show(ev, f"👤 <b>Accounts</b> ({len(accs)})", kb(rows))
 
@@ -504,11 +507,12 @@ async def on_phone(m: Message, state: FSMContext):
 async def finish_login(m: Message, state: FSMContext, client, phone):
     me = await client.get_me()
     name = " ".join(x for x in [me.first_name, me.last_name] if x) or (me.username or phone)
+    was = db.account_by_tg(me.id)
     aid = db.upsert_account(me.id, phone, name, enc(client.session.save()))
     engine.adopt_client(aid, client)
     pending_login.pop(m.from_user.id, None)
     await state.clear()
-    msg = await m.answer(f"✅ <b>{html.escape(name)}</b> added. Checking channel...")
+    msg = await m.answer(f"✅ <b>{html.escape(name)}</b> " + ("was already added (session refreshed)." if was else "added.") + " Checking channel...")
     try:
         ch, how = await engine.ensure_channel(db.account(aid), client)
         await msg.edit_text(f"✅ <b>{html.escape(name)}</b> added.\n📣 {how}: "
@@ -552,7 +556,7 @@ async def on_session_in(m: Message, state: FSMContext):
     if not cands:
         return await m.answer("❌ No valid session string/file found in that. Send again or /menu:")
     status = await m.answer(f"🔍 Found {len(cands)} session(s), checking...")
-    ok, fail = [], []
+    ok, fail, dup = [], [], []
     for label, sess in cands:
         client = engine.make_client(sess)
         try:
@@ -563,6 +567,10 @@ async def on_session_in(m: Message, state: FSMContext):
                 continue
             me = await client.get_me()
             name2 = " ".join(x for x in [me.first_name, me.last_name] if x) or (me.username or label)
+            if db.account_by_tg(me.id):
+                await client.disconnect()
+                dup.append(name2)
+                continue
             aid = db.upsert_account(me.id, me.phone or "", name2, enc(client.session.save()))
         except Exception as e:
             try:
@@ -582,6 +590,8 @@ async def on_session_in(m: Message, state: FSMContext):
     parts = []
     if ok:
         parts.append(f"✅ <b>{len(ok)} account(s) added:</b>\n" + "\n".join(f"• {x}" for x in ok))
+    if dup:
+        parts.append(f"ℹ️ <b>Already added ({len(dup)}):</b>\n" + "\n".join(f"• {html.escape(x)}" for x in dup))
     if fail:
         parts.append(f"❌ <b>{len(fail)} failed:</b>\n" + "\n".join(f"• {x}" for x in fail))
     await status.edit_text(("\n\n".join(parts) or "❌ Nothing added.")[:4000])
@@ -627,6 +637,61 @@ async def on_pwd(m: Message, state: FSMContext):
     except Exception as e:
         return await m.answer(f"❌ {html.escape(str(e))}\nSend the password again or /menu:")
     await finish_login(m, state, p["client"], p["phone"])
+
+
+# ----- one 2FA password check/set across all accounts -----
+@router.callback_query(F.data == "acc:pwall")
+async def cb_acc_pwall(c: CallbackQuery, state: FSMContext):
+    if not db.accounts():
+        return await c.answer("No accounts yet.", show_alert=True)
+    await state.set_state(S.pw_new)
+    await show(c, "🔐 Send the 2FA password you want on ALL accounts (your message is deleted right away).\n"
+                  "Accounts that already have it are left as-is, accounts with no 2FA get it set, and accounts "
+                  "with a DIFFERENT password are reported, untouched.",
+               kb([[("❌ Cancel", "acc:list")]]))
+
+
+@router.message(S.pw_new)
+async def on_pw_new(m: Message, state: FSMContext):
+    pw = (m.text or "").strip()
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    await state.clear()
+    if not pw:
+        return await m.answer("❌ Empty password, nothing done.")
+    status = await m.answer("🔐 Checking all accounts...")
+    same, setnew, other, failed = [], [], [], []
+    for a in db.accounts():
+        label = a["name"] or a["phone"] or str(a["id"])
+        try:
+            info = await engine.account_info(a)
+        except Exception as e:
+            failed.append(f"{label}: {e}")
+            continue
+        try:
+            if info["two_fa"]:
+                await engine.change_2fa(a, pw, pw)  # same old+new: verifies the password, no real change if it matches
+                same.append(label)
+            else:
+                await engine.change_2fa(a, None, pw)
+                setnew.append(label)
+        except errors.PasswordHashInvalidError:
+            other.append(label)
+        except Exception as e:
+            failed.append(f"{label}: {e}")
+    parts = []
+    if same:
+        parts.append("✅ <b>Already has this password:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in same))
+    if setnew:
+        parts.append("🆕 <b>Had no 2FA, now set:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in setnew))
+    if other:
+        parts.append("⚠️ <b>Has a DIFFERENT password:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in other))
+    if failed:
+        parts.append("❌ <b>Could not check:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in failed))
+    await status.edit_text(("\n\n".join(parts) or "Nothing to do.")[:4000])
+    await screen_accounts(m)
 
 
 # ----- job -----

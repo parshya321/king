@@ -175,6 +175,11 @@ class Engine:
             raise RuntimeError("session is logged out, add the account again")
         return c
 
+    async def change_2fa(self, acc: dict, current: str | None, new: str):
+        """Set/replace the cloud password. current=None if the account has no 2FA yet."""
+        client = await self.client_for(acc)
+        await client.edit_2fa(current_password=current or None, new_password=new)
+
     async def account_info(self, acc: dict) -> dict:
         """Live info seedhe Telegram se: id, phone, username, 2FA (cloud password) status."""
         client = await self.client_for(acc)
