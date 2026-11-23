@@ -187,8 +187,9 @@ class Engine:
         try:
             pwd = await client(GetPasswordRequest())
             two_fa = bool(pwd.has_password)
-        except Exception:
-            two_fa = None  # pata nahi chal paya
+        except Exception as e:
+            log.warning("GetPasswordRequest failed: %r", e)
+            two_fa = None  # could not read
         return {
             "id": me.id,
             "phone": me.phone,

@@ -28,6 +28,8 @@ class S(StatesGroup):
     pwd = State()
     session_in = State()
     pw_new = State()
+    pw_cur = State()
+    pw_newone = State()
     edit = State()
     chan = State()
 
@@ -252,6 +254,7 @@ async def screen_account(ev, aid):
         [("⏸ Pause" if a["active"] else "▶️ Activate", f"acc:tog:{aid}")],
         [("📣 Auto channel (find/create)", f"acc:auto:{aid}")],
         [("🆔 Set channel ID/@username", f"acc:ch:{aid}")],
+        [("🔐 Change 2FA", f"acc:pwset:{aid}")],
         [("🔄 Refresh info", f"acc:{aid}")],
         [("🗑 Remove", f"acc:del:{aid}")],
         [("⬅️ Accounts", "acc:list")],
@@ -639,21 +642,101 @@ async def on_pwd(m: Message, state: FSMContext):
     await finish_login(m, state, p["client"], p["phone"])
 
 
-# ----- one 2FA password check/set across all accounts -----
+# ----- 2FA: show status first, then set a new password on the accounts that have none -----
+def _acc_label(a: dict) -> str:
+    return a["name"] or a["phone"] or str(a["id"])
+
+
+# ----- 2FA: change one account's password (you provide its current one) -----
+@router.callback_query(F.data.startswith("acc:pwset:"))
+async def cb_acc_pwset(c: CallbackQuery, state: FSMContext):
+    aid = int(c.data.split(":")[2])
+    await state.set_state(S.pw_cur)
+    await state.update_data(aid=aid)
+    await show(c, "🔑 Send this account's CURRENT 2FA password, or /none if it has no 2FA yet:",
+               kb([[("❌ Cancel", f"acc:{aid}")]]))
+
+
+@router.message(S.pw_cur)
+async def on_pw_cur(m: Message, state: FSMContext):
+    txt = (m.text or "").strip()
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    cur = None if txt.lower() in ("/none", "none", "") else txt
+    await state.update_data(cur=cur)
+    await state.set_state(S.pw_newone)
+    await m.answer("🔑 Now send the NEW password:")
+
+
+@router.message(S.pw_newone)
+async def on_pw_newone(m: Message, state: FSMContext):
+    d = await state.get_data()
+    aid, cur = d.get("aid"), d.get("cur")
+    new = (m.text or "").strip()
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    await state.clear()
+    if not new:
+        return await m.answer("❌ Empty password, nothing done.")
+    a = db.account(aid) if aid else None
+    if not a:
+        return await m.answer("Account not found, go back via /menu.")
+    try:
+        await engine.change_2fa(a, cur, new)
+        await m.answer(f"✅ 2FA changed for <b>{html.escape(_acc_label(a))}</b>.")
+    except errors.PasswordHashInvalidError:
+        await m.answer("❌ Wrong current password. Try 🔐 Change 2FA again.")
+    except Exception as e:
+        await m.answer(f"❌ {html.escape(str(e))}")
+    await screen_account(m, aid)
+
+
 @router.callback_query(F.data == "acc:pwall")
 async def cb_acc_pwall(c: CallbackQuery, state: FSMContext):
-    if not db.accounts():
+    accs = db.accounts()
+    if not accs:
         return await c.answer("No accounts yet.", show_alert=True)
-    await state.set_state(S.pw_new)
-    await show(c, "🔐 Send the 2FA password you want on ALL accounts (your message is deleted right away).\n"
-                  "Accounts that already have it are left as-is, accounts with no 2FA get it set, and accounts "
-                  "with a DIFFERENT password are reported, untouched.",
-               kb([[("❌ Cancel", "acc:list")]]))
+    await c.answer("Checking...")
+    have, none_, failed = [], [], []
+    for a in accs:
+        try:
+            info = await engine.account_info(a)
+        except Exception as e:
+            failed.append(f"{_acc_label(a)}: {e}")
+            continue
+        if info["two_fa"] is None:
+            failed.append(f"{_acc_label(a)}: could not read 2FA status")
+        elif info["two_fa"]:
+            have.append(a)
+        else:
+            none_.append(a)
+    lines = ["🔐 <b>2FA status</b>"]
+    if have:
+        lines.append("✅ <b>Already has 2FA:</b>\n" + "\n".join(f"• {html.escape(_acc_label(a))}" for a in have))
+    if none_:
+        lines.append("🆕 <b>No 2FA yet:</b>\n" + "\n".join(f"• {html.escape(_acc_label(a))}" for a in none_))
+    if failed:
+        lines.append("❌ <b>Could not check:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in failed))
+    if none_:
+        await state.set_state(S.pw_new)
+        await state.update_data(targets=[a["id"] for a in none_])
+        lines.append("🔑 Send the password to SET on the accounts with <b>no 2FA</b> listed above:")
+        await show(c, "\n\n".join(lines)[:4000], kb([[("❌ Cancel", "acc:list")]]))
+    else:
+        lines.append("Nothing to set — every account already has 2FA (or couldn't be checked). "
+                      "Accounts with an existing password aren't touched here, since changing one needs its own current password.")
+        await show(c, "\n\n".join(lines)[:4000], kb([BACK]))
 
 
 @router.message(S.pw_new)
 async def on_pw_new(m: Message, state: FSMContext):
     pw = (m.text or "").strip()
+    data = await state.get_data()
+    targets = data.get("targets", [])
     try:
         await m.delete()
     except Exception:
@@ -661,36 +744,26 @@ async def on_pw_new(m: Message, state: FSMContext):
     await state.clear()
     if not pw:
         return await m.answer("❌ Empty password, nothing done.")
-    status = await m.answer("🔐 Checking all accounts...")
-    same, setnew, other, failed = [], [], [], []
-    for a in db.accounts():
-        label = a["name"] or a["phone"] or str(a["id"])
-        try:
-            info = await engine.account_info(a)
-        except Exception as e:
-            failed.append(f"{label}: {e}")
+    if not targets:
+        return await m.answer("❌ Nothing to set (session expired). Try 🔐 2FA again.")
+    status = await m.answer(f"🔐 Setting password on {len(targets)} account(s)...")
+    ok, failed = [], []
+    for aid in targets:
+        a = db.account(aid)
+        if not a:
             continue
+        label = _acc_label(a)
         try:
-            if info["two_fa"]:
-                await engine.change_2fa(a, pw, pw)  # same old+new: verifies the password, no real change if it matches
-                same.append(label)
-            else:
-                await engine.change_2fa(a, None, pw)
-                setnew.append(label)
-        except errors.PasswordHashInvalidError:
-            other.append(label)
+            await engine.change_2fa(a, None, pw)
+            ok.append(label)
         except Exception as e:
-            failed.append(f"{label}: {e}")
+            failed.append(f"{label}: {type(e).__name__}: {e}")
     parts = []
-    if same:
-        parts.append("✅ <b>Already has this password:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in same))
-    if setnew:
-        parts.append("🆕 <b>Had no 2FA, now set:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in setnew))
-    if other:
-        parts.append("⚠️ <b>Has a DIFFERENT password:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in other))
+    if ok:
+        parts.append(f"✅ <b>Password set ({len(ok)}):</b>\n" + "\n".join(f"• {html.escape(x)}" for x in ok))
     if failed:
-        parts.append("❌ <b>Could not check:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in failed))
-    await status.edit_text(("\n\n".join(parts) or "Nothing to do.")[:4000])
+        parts.append(f"❌ <b>Failed ({len(failed)}):</b>\n" + "\n".join(f"• {html.escape(x)}" for x in failed))
+    await status.edit_text(("\n\n".join(parts) or "Nothing done.")[:4000])
     await screen_accounts(m)
 
 
