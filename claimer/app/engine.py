@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 
 from telethon import TelegramClient, errors, events
 from telethon.sessions import StringSession
+from telethon.tl.functions.account import GetPasswordRequest
 from telethon.tl.functions.account import UpdateUsernameRequest as AccUser
 from telethon.tl.functions.channels import CreateChannelRequest, GetAdminedPublicChannelsRequest
 from telethon.tl.functions.channels import UpdateUsernameRequest as ChUser
@@ -121,7 +122,7 @@ class Engine:
             return
         m = re.search(r"\b(\d{4,8})\b", text)
         extra = f"\n\n🔢 <b>Code:</b> <code>{m.group(1)}</code>" if m else ""
-        await self.notify(f"🔑 <b>{html.escape(label)}</b> ko Telegram se message aaya (login/OTP ho sakta hai):\n\n"
+        await self.notify(f"🔑 <b>{html.escape(label)}</b> got a message from Telegram (could be a login/OTP code):\n\n"
                           f"{html.escape(text)}{extra}")
 
     async def start_otp_listener(self, acc: dict):
@@ -171,8 +172,26 @@ class Engine:
         if not c.is_connected():
             await c.connect()
         if not await c.is_user_authorized():
-            raise RuntimeError("session logout ho gaya, account dobara add karo")
+            raise RuntimeError("session is logged out, add the account again")
         return c
+
+    async def account_info(self, acc: dict) -> dict:
+        """Live info seedhe Telegram se: id, phone, username, 2FA (cloud password) status."""
+        client = await self.client_for(acc)
+        me = await client.get_me()
+        try:
+            pwd = await client(GetPasswordRequest())
+            two_fa = bool(pwd.has_password)
+        except Exception:
+            two_fa = None  # pata nahi chal paya
+        return {
+            "id": me.id,
+            "phone": me.phone,
+            "username": me.username,
+            "first_name": me.first_name,
+            "last_name": me.last_name,
+            "two_fa": two_fa,
+        }
 
     def adopt_client(self, aid: int, client: TelegramClient):
         self.clients[aid] = client
@@ -212,15 +231,15 @@ class Engine:
                 saved = acc.get("channel_id")
                 ch = next((c for c in match if c.id == saved), match[0])
                 self.db.update_account(acc["id"], channel_id=ch.id)
-                return ch, f"'{prefix.upper()}' se shuru hone wali channel mili"
-            if acc.get("channel_id"):  # pehle claim ho chuki channel (username ab target hai) dobara use ho sake
+                return ch, f"found channel starting with '{prefix.upper()}'"
+            if acc.get("channel_id"):  # reuse a channel already claimed before (its username is now the target)
                 dialogs = [d.entity async for d in client.iter_dialogs(limit=300) if isinstance(d.entity, Channel)]
                 for e in dialogs:
                     if e.id == acc["channel_id"] and e.broadcast and e.creator:
                         return await self._make_public(client, e), "saved channel"
-            raise RuntimeError(f"is account me '{prefix.upper()}' se shuru hone wali public channel nahi mili. "
-                               f"Telegram app me ek public channel banao jiska username '{prefix.upper()}' se shuru ho, "
-                               "phir account dobara add karo (ya /menu me use dobara activate karo).")
+            raise RuntimeError(f"No public channel starting with '{prefix.upper()}' was found on this account. "
+                               f"Create a public channel in the Telegram app with a username starting with "
+                               f"'{prefix.upper()}', then add the account again (or reactivate it from /menu).")
         dialogs = [d.entity async for d in client.iter_dialogs(limit=300) if isinstance(d.entity, Channel)]
         owned = [e for e in dialogs if e.broadcast and e.creator]
         if acc.get("channel_id"):
@@ -230,18 +249,18 @@ class Engine:
         for e in owned:
             if e.username:
                 self.db.update_account(acc["id"], channel_id=e.id)
-                return e, "existing public channel mili"
+                return e, "found an existing public channel"
         res = await client(CreateChannelRequest(title="Notes", about="", broadcast=True))
         ch = await self._make_public(client, res.chats[0])
         self.db.update_account(acc["id"], channel_id=ch.id)
-        return ch, "nayi public channel bani"
+        return ch, "created a new public channel"
 
     async def set_channel(self, acc: dict, ref: str) -> Channel:
         client = await self.client_for(acc)
         ref = ref.strip().lstrip("@")
         ent = await client.get_entity(int(ref) if re.fullmatch(r"-?\d+", ref) else ref)
         if not isinstance(ent, Channel) or not ent.broadcast or not ent.creator:
-            raise ValueError("Ye is account ki apni (creator) broadcast channel nahi hai")
+            raise ValueError("This is not a broadcast channel owned (created) by this account")
         ent = await self._make_public(client, ent)
         self.db.update_account(acc["id"], channel_id=ent.id)
         return ent
@@ -298,7 +317,7 @@ class Engine:
                     pass
                 stats.append(stat)
             except Exception as e:
-                await self.notify(f"⚠️ Account <b>{html.escape(acc.get('phone') or '?')}</b> ready nahi hua: {html.escape(str(e))}")
+                await self.notify(f"⚠️ Account <b>{html.escape(acc.get('phone') or '?')}</b> not ready: {html.escape(str(e))}")
 
         await asyncio.gather(*(one(a) for a in accs))
         if stats:
@@ -317,15 +336,15 @@ class Engine:
             self.phase = "preparing"
             stats = await self._prepare()
             if not stats:
-                await self.notify("❌ Koi bhi account ready nahi, job cancel.")
+                await self.notify("❌ No account is ready, job cancelled.")
                 return
-            await self.notify(f"🟢 {len(stats)} account ready. Target <code>@{self.db.get('target')}</code> pe tries "
-                              f"<b>{fmt_ts(epoch)} IST</b> se shuru honge (clock offset {self.offset * 1000:+.0f}ms).")
+            await self.notify(f"🟢 {len(stats)} account(s) ready. Tries for target <code>@{self.db.get('target')}</code> "
+                              f"will start at <b>{fmt_ts(epoch)} IST</b> (clock offset {self.offset * 1000:+.0f}ms).")
             await self._sleep_until(epoch)
             self.phase = "running"
             await self._attack(stats, epoch, forever)
         except asyncio.CancelledError:
-            await self.notify("⏹ Job stop kar diya.")
+            await self.notify("⏹ Job stopped.")
             raise
         except Exception as e:
             log.exception("job crash")
@@ -431,18 +450,18 @@ class Engine:
             st.paused_until = self.now() + e.seconds
             self.db.set(f"flood_until_{st.acc['id']}", time.time() + e.seconds)
             rq = getattr(e, "request", None)
-            rq = getattr(rq, "query", rq)  # receive_updates=False me request InvokeWithoutUpdates me lipti hoti hai
+            rq = getattr(rq, "query", rq)  # receive_updates=False wraps the request inside InvokeWithoutUpdates
             req = type(rq).__name__ if rq is not None else "?"
-            await self.notify(f"⏳ <b>FloodWait</b>: <code>{html.escape(st.label)}</code> par "
-                              f"<b>{e.seconds}s</b> ka flood wait laga ({fmt_ts(ts)}), request: <code>{req}</code>, "
-                              f"is account ki try #{n} par (sab accounts milake kul {sum(x.attempts for x in self.live)} tries ke baad). "
-                              f"Itni der ye account pause.")
+            await self.notify(f"⏳ <b>FloodWait</b>: <code>{html.escape(st.label)}</code> got a "
+                              f"<b>{e.seconds}s</b> flood wait ({fmt_ts(ts)}), request: <code>{req}</code>, "
+                              f"on this account's try #{n} (after {sum(x.attempts for x in self.live)} total tries across all accounts). "
+                              f"This account is paused for that long.")
         except errors.RPCError as e:
             name = type(e).__name__
             st.errors[name] += 1
             if any(k in (e.message or "") for k in DEAD_ERRORS):
                 st.dead = True
-                await self.notify(f"☠️ Account <code>{html.escape(st.label)}</code> dead/logout: {html.escape(e.message)}")
+                await self.notify(f"☠️ Account <code>{html.escape(st.label)}</code> dead/logged out: {html.escape(e.message)}")
         except Exception as e:
             st.errors[type(e).__name__] += 1
         finally:
@@ -459,22 +478,22 @@ class Engine:
         ok = self.winner is not None
         total = sum(s.attempts for s in stats)
         lines = [
-            f"{'✅ <b>USERNAME MIL GAYA</b>' if ok else '❌ <b>Username nahi mila</b>'} — <code>@{html.escape(target)}</code>",
+            f"{'✅ <b>USERNAME CLAIMED</b>' if ok else '❌ <b>Username not claimed</b>'} — <code>@{html.escape(target)}</code>",
             "",
             f"🕒 Schedule: {fmt_ts(epoch)} IST",
-            f"▶️ Shuru: {fmt_ts(started)} | ⏹ Khatam: {fmt_ts(finished)}",
+            f"▶️ Started: {fmt_ts(started)} | ⏹ Finished: {fmt_ts(finished)}",
             f"⏱ Duration: {finished - epoch:.2f}s | Gap: {self.db.int('gap_ms') / 1000:g}s",
-            f"🔁 Total attempts: <b>{total}</b> ({len(stats)} account)",
+            f"🔁 Total attempts: <b>{total}</b> ({len(stats)} account(s))",
         ]
         if ok:
             w = self.winner
             lines.append(f"🏆 Winner: <code>{html.escape(w.label)}</code> — {fmt_ts(w.win)} IST, "
-                         f"schedule ke <b>{w.win - epoch:.3f}s</b> baad, <b>{w.win_attempt}</b>th attempt par")
+                         f"<b>{w.win - epoch:.3f}s</b> after schedule, on attempt <b>#{w.win_attempt}</b>")
         lines.append("")
         for s in stats:
             errs = ", ".join(f"{k}×{v}" for k, v in s.errors.most_common()) or "-"
             fl = f" | FloodWait: {len(s.floods)}x ({sum(x[1] for x in s.floods)}s total)" if s.floods else ""
-            first = f" | pehla try {fmt_ts(s.first)}" if s.first else ""
+            first = f" | first try {fmt_ts(s.first)}" if s.first else ""
             lines.append(f"• <code>{html.escape(s.label)}</code>: {s.attempts} attempts{first}{fl}\n   errors: {html.escape(errs)}")
         return "\n".join(lines)
 
@@ -489,15 +508,15 @@ class Engine:
         for _ in range(8):
             try:
                 await client(AccUser(target))
-                return f"✅ <code>@{target}</code> ab account ke profile par lag gaya."
+                return f"✅ <code>@{target}</code> is now set on the account's profile."
             except errors.FloodWaitError as e:
-                return f"⏳ FloodWait {e.seconds}s. Username abhi channel se hata hua hai, baad me dobara try karo."
+                return f"⏳ FloodWait {e.seconds}s. Username has been removed from the channel for now, try again later."
             except errors.RPCError as e:
                 last = type(e).__name__
                 await asyncio.sleep(0.3)
-        # fail: channel par wapas lagao
+        # fail: put the username back on the channel
         try:
             await client(ChUser(ch, target))
         except Exception:
             pass
-        return f"❌ Profile par nahi laga ({last}). Username channel par wapas laga diya."
+        return f"❌ Could not set it on the profile ({last}). Username put back on the channel."
