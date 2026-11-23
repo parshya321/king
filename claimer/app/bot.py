@@ -664,10 +664,28 @@ async def on_pw_cur(m: Message, state: FSMContext):
         await m.delete()
     except Exception:
         pass
-    cur = None if txt.lower() in ("/none", "none", "") else txt
-    await state.update_data(cur=cur)
+    d = await state.get_data()
+    aid = d.get("aid")
+    a = db.account(aid) if aid else None
+    if not a:
+        await state.clear()
+        return await m.answer("Account not found, go back via /menu.")
+    if txt.lower() in ("/none", "none", ""):
+        await state.update_data(cur=None)
+        await state.set_state(S.pw_newone)
+        return await m.answer("🔑 Now send the NEW password:")
+    checking = await m.answer("🔍 Checking...")
+    try:
+        ok = await engine.check_2fa(a, txt)
+    except Exception as e:
+        await checking.edit_text(f"❌ {html.escape(str(e))}")
+        return
+    if not ok:
+        await checking.edit_text("❌ Wrong password, try again (or /none if there's really no 2FA):")
+        return  # stay in S.pw_cur so they can retype
+    await state.update_data(cur=txt)
     await state.set_state(S.pw_newone)
-    await m.answer("🔑 Now send the NEW password:")
+    await checking.edit_text("✅ Correct. Now send the NEW password:")
 
 
 @router.message(S.pw_newone)

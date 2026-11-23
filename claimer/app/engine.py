@@ -10,8 +10,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from telethon import TelegramClient, errors, events
+from telethon.password import compute_check
 from telethon.sessions import StringSession
-from telethon.tl.functions.account import GetPasswordRequest
+from telethon.tl.functions.account import GetPasswordRequest, GetPasswordSettingsRequest
 from telethon.tl.functions.account import UpdateUsernameRequest as AccUser
 from telethon.tl.functions.channels import CreateChannelRequest, GetAdminedPublicChannelsRequest
 from telethon.tl.functions.channels import UpdateUsernameRequest as ChUser
@@ -179,6 +180,20 @@ class Engine:
         """Set/replace the cloud password. current=None if the account has no 2FA yet."""
         client = await self.client_for(acc)
         await client.edit_2fa(current_password=current or None, new_password=new)
+
+    async def check_2fa(self, acc: dict, current: str) -> bool:
+        """True if `current` is this account's correct 2FA password. No side effects
+        (uses account.getPasswordSettings, which only verifies, never changes anything)."""
+        client = await self.client_for(acc)
+        pwd = await client(GetPasswordRequest())
+        if not pwd.has_password:
+            return False
+        ic = compute_check(pwd, current)
+        try:
+            await client(GetPasswordSettingsRequest(password=ic))
+            return True
+        except errors.PasswordHashInvalidError:
+            return False
 
     async def account_info(self, acc: dict) -> dict:
         """Live info seedhe Telegram se: id, phone, username, 2FA (cloud password) status."""
