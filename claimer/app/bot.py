@@ -7,10 +7,16 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from telethon import errors
 
-from .config import API_HASH, API_ID, enc
+from .config import API_HASH, API_ID, dec, enc
 from .sessions import extract_candidates
 from .engine import Engine, fmt_ts, parse_sched, sched_epoch
 
@@ -216,10 +222,12 @@ async def screen_settings(ev, adv=False):
 
 async def screen_accounts(ev):
     accs = db.accounts()
-    rows = [[(f"{'✅' if a['active'] else '⏸'} {a['name'] or a['phone']}", f"acc:{a['id']}")] for a in accs]
+    rows = [[(f"{i+1}. {'✅' if a['active'] else '⏸'} {a['name'] or a['phone']}", f"acc:{a['id']}")]
+            for i, a in enumerate(accs)]
     rows.append([("📞 Add by phone", "acc:add"), ("📄 Add by session", "acc:addsession")])
     if accs:
-        rows.append([("🔐 2FA", "acc:pwall")])
+        rows.append([("🔐 2FA", "acc:pwall"), ("🚪 Terminate others (ALL)", "acc:killall")])
+        rows.append([("📤 Export all sessions", "acc:export")])
     rows.append(BACK)
     await show(ev, f"👤 <b>Accounts</b> ({len(accs)})", kb(rows))
 
@@ -228,8 +236,10 @@ async def screen_account(ev, aid):
     a = db.account(aid)
     if not a:
         return await screen_accounts(ev)
+    accs = db.accounts()
+    idx = next((i + 1 for i, x in enumerate(accs) if x["id"] == aid), "?")
     lines = [
-        f"👤 <b>{html.escape(a['name'] or '')}</b>",
+        f"👤 <b>#{idx} {html.escape(a['name'] or '')}</b>",
         f"📞 Phone: {html.escape(a['phone'] or '—')}",
         f"Status: {'active' if a['active'] else 'paused'}",
         f"Channel ID: <code>{a['channel_id'] or 'not set yet (auto-found before a job runs)'}</code>",
@@ -255,6 +265,7 @@ async def screen_account(ev, aid):
         [("📣 Auto channel (find/create)", f"acc:auto:{aid}")],
         [("🆔 Set channel ID/@username", f"acc:ch:{aid}")],
         [("🔐 Change 2FA", f"acc:pwset:{aid}")],
+        [("🚪 Terminate other sessions", f"acc:kill:{aid}")],
         [("🔄 Refresh info", f"acc:{aid}")],
         [("🗑 Remove", f"acc:del:{aid}")],
         [("⬅️ Accounts", "acc:list")],
@@ -447,6 +458,93 @@ async def cb_acc_del(c: CallbackQuery):
     await engine.stop_otp_listener(aid)
     db.delete_account(aid)
     await screen_accounts(c)
+
+
+@router.callback_query(F.data.startswith("acc:kill:"))
+async def cb_acc_kill(c: CallbackQuery):
+    parts = c.data.split(":")
+    aid = int(parts[2])
+    a = db.account(aid)
+    if not a:
+        return await screen_accounts(c)
+    if len(parts) == 3:
+        return await show(c, f"🚪 Log out every OTHER device/session of <b>{html.escape(_acc_label(a))}</b>? "
+                              "This bot's own login stays active, everything else (phone, other apps, web) "
+                              "gets logged out.",
+                          kb([[("✅ Yes, terminate others", f"acc:kill:{aid}:y"), ("❌ No", f"acc:{aid}")]]))
+    await c.answer("Working on it...")
+    try:
+        await engine.terminate_other_sessions(a)
+        await c.message.answer(f"🚪 Done. Every other session of <b>{html.escape(_acc_label(a))}</b> is logged out, "
+                               "only this bot's login remains.")
+    except Exception as e:
+        await c.message.answer(f"❌ {html.escape(str(e))}")
+    await screen_account(c, aid)
+
+
+@router.callback_query(F.data == "acc:killall")
+async def cb_acc_killall(c: CallbackQuery):
+    accs = db.accounts()
+    if not accs:
+        return await c.answer("No accounts yet.", show_alert=True)
+    await show(c, f"🚪 Log out every OTHER device/session on ALL {len(accs)} account(s)? "
+                  "Each bot login stays active, everything else gets logged out. This is a one-time "
+                  "cleanup action.",
+               kb([[("✅ Yes, do all", "acc:killall:y")], [("❌ No", "acc:list")]]))
+
+
+@router.callback_query(F.data == "acc:killall:y")
+async def cb_acc_killall_go(c: CallbackQuery):
+    accs = db.accounts()
+    await c.answer("Working on it...")
+    status = await c.message.answer(f"🚪 Terminating other sessions on {len(accs)} account(s)...")
+    ok, failed = [], []
+    for a in accs:
+        label = _acc_label(a)
+        try:
+            await engine.terminate_other_sessions(a)
+            ok.append(label)
+        except Exception as e:
+            failed.append(f"{label}: {html.escape(str(e))}")
+    parts = []
+    if ok:
+        parts.append(f"✅ <b>Done ({len(ok)}):</b>\n" + "\n".join(f"• {html.escape(x)}" for x in ok))
+    if failed:
+        parts.append(f"❌ <b>Failed ({len(failed)}):</b>\n" + "\n".join(f"• {x}" for x in failed))
+    await status.edit_text(("\n\n".join(parts) or "Nothing done.")[:4000])
+    await screen_accounts(c)
+
+
+@router.callback_query(F.data == "acc:export")
+async def cb_acc_export(c: CallbackQuery):
+    accs = db.accounts()
+    if not accs:
+        return await c.answer("No accounts yet.", show_alert=True)
+    await c.answer("Exporting...")
+    seen_names = set()
+    ok, failed = 0, 0
+    for i, a in enumerate(accs, 1):
+        safe = re.sub(r"[^A-Za-z0-9+_-]+", "_", _acc_label(a)).strip("_") or "account"
+        base = f"{i:02d}_{safe}"
+        name, n = base, 1
+        while name in seen_names:
+            n += 1
+            name = f"{base}_{n}"
+        seen_names.add(name)
+        try:
+            sess = dec(a["session"])
+        except Exception as e:
+            await c.message.answer(f"❌ {html.escape(_acc_label(a))}: could not decrypt ({html.escape(str(e))})")
+            failed += 1
+            continue
+        doc = BufferedInputFile(sess.encode("utf-8"), filename=f"{name}.txt")
+        await c.message.answer_document(doc, caption=f"🔑 {html.escape(_acc_label(a))}")
+        ok += 1
+    await c.message.answer(
+        f"📤 {ok} session(s) sent as separate files" + (f", {failed} failed" if failed else "") + ".\n"
+        "⚠️ Keep them safe and delete when done — anyone who has one of these gets full access "
+        "to that account, same as the password."
+    )
 
 
 @router.callback_query(F.data.startswith("acc:auto:"))

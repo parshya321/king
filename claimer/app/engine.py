@@ -14,6 +14,7 @@ from telethon.password import compute_check
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import GetPasswordRequest, GetPasswordSettingsRequest
 from telethon.tl.functions.account import UpdateUsernameRequest as AccUser
+from telethon.tl.functions.auth import ResetAuthorizationsRequest
 from telethon.tl.functions.channels import CreateChannelRequest, GetAdminedPublicChannelsRequest
 from telethon.tl.functions.channels import UpdateUsernameRequest as ChUser
 from telethon.tl.types import Channel
@@ -194,6 +195,12 @@ class Engine:
             return True
         except errors.PasswordHashInvalidError:
             return False
+
+    async def terminate_other_sessions(self, acc: dict):
+        """Logs out every OTHER device/session of this account, keeping only the one this
+        bot is currently using (same as Telegram's own "Terminate All Other Sessions")."""
+        client = await self.client_for(acc)
+        await client(ResetAuthorizationsRequest())
 
     async def account_info(self, acc: dict) -> dict:
         """Live info seedhe Telegram se: id, phone, username, 2FA (cloud password) status."""
