@@ -1,3 +1,4 @@
+import asyncio
 import html
 import re
 import time
@@ -226,8 +227,8 @@ async def screen_accounts(ev):
             for i, a in enumerate(accs)]
     rows.append([("📞 Add by phone", "acc:add"), ("📄 Add by session", "acc:addsession")])
     if accs:
-        rows.append([("🔐 2FA", "acc:pwall"), ("🚪 Terminate others (ALL)", "acc:killall")])
-        rows.append([("📤 Export all sessions", "acc:export")])
+        rows.append([("🔐 2FA", "acc:pwall"), ("📤 Export all sessions", "acc:export")])
+        rows.append([("🏗 Make 'P' channels", "acc:mkchan")])
     rows.append(BACK)
     await show(ev, f"👤 <b>Accounts</b> ({len(accs)})", kb(rows))
 
@@ -259,6 +260,11 @@ async def screen_account(ev, aid):
             lines.append("🔐 2FA: could not check")
         else:
             lines.append(f"🔐 2FA (cloud password): <b>{'ON' if info['two_fa'] else 'OFF'}</b>")
+    saved = _saved_2fa(a)
+    if saved:
+        lines.append(f"🔑 Saved password: <code>{html.escape(saved)}</code>")
+    elif info and info.get("two_fa"):
+        lines.append("🔑 Saved password: <i>not saved in bot (set/change it via 🔐 Change 2FA to save)</i>")
     text = "\n".join(lines)
     rows = [
         [("⏸ Pause" if a["active"] else "▶️ Activate", f"acc:tog:{aid}")],
@@ -482,37 +488,27 @@ async def cb_acc_kill(c: CallbackQuery):
     await screen_account(c, aid)
 
 
-@router.callback_query(F.data == "acc:killall")
-async def cb_acc_killall(c: CallbackQuery):
+@router.callback_query(F.data == "acc:mkchan")
+async def cb_acc_mkchan(c: CallbackQuery):
     accs = db.accounts()
     if not accs:
         return await c.answer("No accounts yet.", show_alert=True)
-    await show(c, f"🚪 Log out every OTHER device/session on ALL {len(accs)} account(s)? "
-                  "Each bot login stays active, everything else gets logged out. This is a one-time "
-                  "cleanup action.",
-               kb([[("✅ Yes, do all", "acc:killall:y")], [("❌ No", "acc:list")]]))
+    if getattr(engine, "_ch_job", False):
+        return await c.answer("Already running.", show_alert=True)
+    prefix = (db.get("channel_prefix") or "p").strip().lstrip("@").upper() or "P"
+    await show(c, f"🏗 Create a '{prefix}' public channel on each of the {len(accs)} account(s) that doesn't "
+                  f"already have one? Accounts that already have one are skipped. It runs slowly (a gap between "
+                  "each account) to stay safe, and posts progress here. One-time action.",
+               kb([[("✅ Yes, start", "acc:mkchan:go")], [("❌ No", "acc:list")]]))
 
 
-@router.callback_query(F.data == "acc:killall:y")
-async def cb_acc_killall_go(c: CallbackQuery):
-    accs = db.accounts()
-    await c.answer("Working on it...")
-    status = await c.message.answer(f"🚪 Terminating other sessions on {len(accs)} account(s)...")
-    ok, failed = [], []
-    for a in accs:
-        label = _acc_label(a)
-        try:
-            await engine.terminate_other_sessions(a)
-            ok.append(label)
-        except Exception as e:
-            failed.append(f"{label}: {html.escape(str(e))}")
-    parts = []
-    if ok:
-        parts.append(f"✅ <b>Done ({len(ok)}):</b>\n" + "\n".join(f"• {html.escape(x)}" for x in ok))
-    if failed:
-        parts.append(f"❌ <b>Failed ({len(failed)}):</b>\n" + "\n".join(f"• {x}" for x in failed))
-    await status.edit_text(("\n\n".join(parts) or "Nothing done.")[:4000])
-    await screen_accounts(c)
+@router.callback_query(F.data == "acc:mkchan:go")
+async def cb_acc_mkchan_go(c: CallbackQuery):
+    if getattr(engine, "_ch_job", False):
+        return await c.answer("Already running.", show_alert=True)
+    await c.answer("Started")
+    asyncio.create_task(engine.make_missing_prefix_channels())
+    await show(c, "🏗 Started. I'll message progress here, one account at a time.", kb([BACK]))
 
 
 @router.callback_query(F.data == "acc:export")
@@ -605,11 +601,13 @@ async def on_phone(m: Message, state: FSMContext):
                    "(sending it plain makes Telegram expire the code).")
 
 
-async def finish_login(m: Message, state: FSMContext, client, phone):
+async def finish_login(m: Message, state: FSMContext, client, phone, twofa=None):
     me = await client.get_me()
     name = " ".join(x for x in [me.first_name, me.last_name] if x) or (me.username or phone)
     was = db.account_by_tg(me.id)
     aid = db.upsert_account(me.id, phone, name, enc(client.session.save()))
+    if twofa:
+        _save_2fa(aid, twofa)
     engine.adopt_client(aid, client)
     pending_login.pop(m.from_user.id, None)
     await state.clear()
@@ -737,12 +735,31 @@ async def on_pwd(m: Message, state: FSMContext):
         await p["client"].sign_in(password=pw)
     except Exception as e:
         return await m.answer(f"❌ {html.escape(str(e))}\nSend the password again or /menu:")
-    await finish_login(m, state, p["client"], p["phone"])
+    await finish_login(m, state, p["client"], p["phone"], twofa=pw)
 
 
 # ----- 2FA: show status first, then set a new password on the accounts that have none -----
 def _acc_label(a: dict) -> str:
     return a["name"] or a["phone"] or str(a["id"])
+
+
+def _save_2fa(aid: int, pw: str):
+    """Account ka 2FA password encrypted DB me save karo (yaad rakhne ke liye)."""
+    try:
+        db.update_account(aid, twofa=enc(pw) if pw else None)
+    except Exception:
+        pass
+
+
+def _saved_2fa(a: dict) -> str | None:
+    """DB me saved 2FA password wapas (decrypt karke), warna None."""
+    v = a.get("twofa")
+    if not v:
+        return None
+    try:
+        return dec(v)
+    except Exception:
+        return None
 
 
 # ----- 2FA: change one account's password (you provide its current one) -----
@@ -803,6 +820,7 @@ async def on_pw_newone(m: Message, state: FSMContext):
         return await m.answer("Account not found, go back via /menu.")
     try:
         await engine.change_2fa(a, cur, new)
+        _save_2fa(aid, new)
         await m.answer(f"✅ 2FA changed for <b>{html.escape(_acc_label(a))}</b>.")
     except errors.PasswordHashInvalidError:
         await m.answer("❌ Wrong current password. Try 🔐 Change 2FA again.")
@@ -871,6 +889,7 @@ async def on_pw_new(m: Message, state: FSMContext):
         label = _acc_label(a)
         try:
             await engine.change_2fa(a, None, pw)
+            _save_2fa(aid, pw)
             ok.append(label)
         except Exception as e:
             failed.append(f"{label}: {type(e).__name__}: {e}")

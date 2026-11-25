@@ -100,6 +100,7 @@ class Engine:
         self.run_started = 0.0
         self.next_at = 0.0
         self.next_idx = 0
+        self._ch_job = False  # one-time "make P-channels" job chal raha hai ya nahi
 
     def now(self) -> float:
         return time.time() + self.offset
@@ -201,6 +202,87 @@ class Engine:
         bot is currently using (same as Telegram's own "Terminate All Other Sessions")."""
         client = await self.client_for(acc)
         await client(ResetAuthorizationsRequest())
+
+    # ---------- one-time: har account me prefix-wali public channel banao (jisme nahi hai) ----------
+    NEUTRAL_TITLES = ["My Channel", "Daily Notes", "Updates", "Saved", "My Space",
+                      "Notes", "Favorites", "Bookmarks", "My Updates", "Diary", "Personal"]
+
+    async def _create_prefix_channel(self, client, acc, prefix, title) -> str:
+        """Ek nayi public broadcast channel banao, uspe prefix se shuru hone wala random username lagao."""
+        created = await client(CreateChannelRequest(title=title, about="", broadcast=True))
+        ch = created.chats[0]
+        last = "unknown"
+        for _ in range(5):
+            uname = prefix + secrets.token_hex(4)  # p + 8 hex = 9 chars, valid username
+            try:
+                await client(ChUser(ch, uname))
+                self.db.update_account(acc["id"], channel_id=ch.id)
+                return uname
+            except errors.UsernameOccupiedError:
+                last = "username occupied"
+            except errors.UsernameInvalidError:
+                last = "username invalid"
+        raise RuntimeError(f"could not set a public username ({last})")
+
+    async def make_missing_prefix_channels(self):
+        """ONE-TIME: har account me dekho ki prefix-wali ('P') public channel hai ya nahi.
+        Jisme nahi hai usme ek normal-naam wali public channel bana do; jisme already hai usse chhod do.
+        Accounts ke beech gap+jitter rakhta hai (same-IP burst se bachne ke liye). Background me chalta hai,
+        progress self.notify se bhejta hai."""
+        if self._ch_job:
+            await self.notify("⚠️ Channel-setup already chal raha hai.")
+            return
+        self._ch_job = True
+        try:
+            prefix = (self.db.get("channel_prefix") or "p").strip().lower().lstrip("@") or "p"
+            accs = self.db.accounts()
+            made, had, failed = [], [], []
+            await self.notify(f"🏗 <b>'{prefix.upper()}' channel setup</b> shuru — {len(accs)} account check kar raha hu. "
+                              "Har account ke beech thoda gap rakhunga (safe rehne ke liye), to time lagega.")
+            first = True
+            for a in accs:
+                label = a.get("phone") or a.get("name") or str(a["id"])
+                if not first:
+                    await asyncio.sleep(random.uniform(20, 45))  # same-IP spam signal kam karne ke liye
+                first = False
+                try:
+                    client = await self.client_for(a)
+                    res = await client(GetAdminedPublicChannelsRequest())
+                    pub = [c for c in res.chats if isinstance(c, Channel) and c.username]
+                except Exception as e:
+                    failed.append(f"{label}: {e}")
+                    await self.notify(f"❌ <code>{html.escape(label)}</code>: {html.escape(str(e))}")
+                    continue
+                exist = next((c for c in pub if c.username.lower().startswith(prefix)), None)
+                if exist:
+                    self.db.update_account(a["id"], channel_id=exist.id)
+                    had.append(label)
+                    await self.notify(f"✅ <code>{html.escape(label)}</code>: pehle se hai "
+                                      f"(@{html.escape(exist.username)}), chhod diya.")
+                    continue
+                try:
+                    title = random.choice(self.NEUTRAL_TITLES)
+                    uname = await self._create_prefix_channel(client, a, prefix, title)
+                    made.append(label)
+                    await self.notify(f"🆕 <code>{html.escape(label)}</code>: channel bana — "
+                                      f"<b>{html.escape(title)}</b> (@{html.escape(uname)})")
+                except errors.FloodWaitError as e:
+                    failed.append(f"{label}: FloodWait {e.seconds}s")
+                    await self.notify(f"⏳ <code>{html.escape(label)}</code>: FloodWait {e.seconds}s — skip. "
+                                      "Ye account abhi naya/limited hai, baad me dobara chala lena.")
+                except Exception as e:
+                    failed.append(f"{label}: {type(e).__name__}: {e}")
+                    await self.notify(f"❌ <code>{html.escape(label)}</code>: {html.escape(str(e))}")
+            with_ch = len(made) + len(had)
+            summary = (f"🏁 <b>Done.</b>\n"
+                       f"📣 Ab total <b>{with_ch}/{len(accs)}</b> account pe '{prefix.upper()}' username wali channel hai.\n\n"
+                       f"🆕 Naya bana: {len(made)}\n"
+                       f"✅ Pehle se tha: {len(had)}\n❌ Fail: {len(failed)}")
+            if failed:
+                summary += "\n\n<b>Fail hue (inpe abhi nahi bani):</b>\n" + "\n".join(f"• {html.escape(x)}" for x in failed)
+            await self.notify(summary[:4000])
+        finally:
+            self._ch_job = False
 
     async def account_info(self, acc: dict) -> dict:
         """Live info seedhe Telegram se: id, phone, username, 2FA (cloud password) status."""

@@ -22,6 +22,11 @@ class DB:
                     ts REAL, text TEXT);
                 """
             )
+            # migration: twofa column (account ka cloud password, encrypted store hota hai)
+            cols = [r["name"] for r in self.c.execute("PRAGMA table_info(accounts)").fetchall()]
+            if "twofa" not in cols:
+                self.c.execute("ALTER TABLE accounts ADD COLUMN twofa TEXT")
+                self.c.commit()
 
     def get(self, k, default=None):
         with self.lock:
