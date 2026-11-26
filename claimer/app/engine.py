@@ -108,7 +108,8 @@ class Engine:
         self.run_started = 0.0
         self.next_at = 0.0
         self.next_idx = 0
-        self._ch_job = False  # one-time "make P-channels" job chal raha hai ya nahi
+        self._ch_job = False  # one-time setup job (channels/usernames) chal raha hai ya nahi
+        self._ch_task: asyncio.Task | None = None
 
     def now(self) -> float:
         return time.time() + self.offset
@@ -211,6 +212,15 @@ class Engine:
         client = await self.client_for(acc)
         await client(ResetAuthorizationsRequest())
 
+    # ---------- one-time setup jobs (channels / usernames) ----------
+    def stop_ch_job(self):
+        """Chal raha one-time setup job (P-channels / usernames) turant cancel karo."""
+        t = self._ch_task
+        if t is not None and not t.done():
+            t.cancel()
+        self._ch_task = None
+        self._ch_job = False
+
     # ---------- one-time: har account me prefix-wali public channel banao (jisme nahi hai) ----------
     NEUTRAL_TITLES = ["My Channel", "Daily Notes", "Updates", "Saved", "My Space",
                       "Notes", "Favorites", "Bookmarks", "My Updates", "Diary", "Personal"]
@@ -243,55 +253,72 @@ class Engine:
         return (random.choice(c) + random.choice(v) + random.choice(c)
                 + random.choice(v) + random.choice(c))
 
+    _UN_ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789"
+    _UN_LET = "abcdefghijklmnopqrstuvwxyz"
+
     async def _find_and_set_account_username(self, client) -> str:
-        """Light account.checkUsername se ek free 5-letter dhoondo, phir SIRF EK account.updateUsername
-        se set karo (taaki account ka ~8-set quota barbaad na ho)."""
-        for _ in range(25):
-            uname = self._rand_username5()
+        """Light account.checkUsername se ek free 5-char username dhoondo, phir SIRF EK account.updateUsername
+        se set karo (taaki account ka ~8-set quota barbaad na ho). Pehle kuch readable, phir random alnum
+        (jo lagbhag hamesha available hote hain)."""
+        last_err = None
+        for i in range(45):
+            if i < 12:  # pehle thode readable (acha dikhe), jaise 'kabor'
+                uname = self._rand_username5()
+            else:  # phir random a-z0-9 (letter se shuru) — koi bhi, almost always free
+                uname = random.choice(self._UN_LET) + "".join(random.choice(self._UN_ALNUM) for _ in range(4))
             try:
                 ok = await client(AccCheckUsername(uname))
             except errors.FloodWaitError:
                 raise
             except errors.UsernameInvalidError:
                 continue
-            except Exception:
+            except Exception as e:
+                last_err = e
                 continue
             if not ok:
                 continue  # taken — koi set-quota use nahi hua, dusra try karo
             await client(AccUser(uname))  # ek hi asli set
             return uname
-        raise RuntimeError("koi free 5-letter username nahi mila (dobara chalao)")
+        if last_err is not None:
+            raise RuntimeError(f"username check error: {last_err}")
+        raise RuntimeError("45 usernames try kiye, sab taken ya account restricted (naya/limited account ho sakta hai)")
 
-    async def set_missing_account_usernames(self):
-        """ONE-TIME: har account ke profile pe username hai ya nahi dekho; jisme nahi hai usme ek achha
-        5-letter username lagao. Pehle light check, phir ek real set. Accounts ke beech gap. Background."""
+    async def set_missing_account_usernames(self, quiet: bool = False):
+        """ONE-TIME / auto-on-deploy: har account ke profile pe username hai ya nahi dekho; jisme nahi hai
+        usme ek 5-letter username lagao (koi bhi free). Pehle light check, phir ek real set (quota-safe).
+        Gap sirf asli set-attempt se pehle (skip fast). quiet=True (startup): sirf final summary, wo bhi
+        tabhi jab kuch hua ho. Background task."""
         if self._ch_job:
-            await self.notify("⚠️ Ek setup already chal raha hai.")
+            if not quiet:
+                await self.notify("⚠️ Ek setup already chal raha hai.")
             return
         self._ch_job = True
         try:
             accs = self.db.accounts()
             made, had, failed = [], [], []
-            await self.notify(f"✍️ <b>Username setup</b> shuru — {len(accs)} account. Jinpe username nahi, "
-                              "unpe ek achha 5-letter username lagaunga. Beech me gap rakhunga (safe), to time lagega.")
-            first = True
+            if not quiet:
+                await self.notify(f"✍️ <b>Username setup</b> shuru — {len(accs)} account. Jinpe username nahi, "
+                                  "unpe ek 5-letter username lagaunga. Set ke beech gap rakhunga (safe).")
+            first_set = True
             for a in accs:
                 label = a.get("phone") or a.get("name") or str(a["id"])
-                if not first:
-                    await asyncio.sleep(random.uniform(20, 45))
-                first = False
                 try:
                     client = await self.client_for(a)
                     me = await client.get_me()
                 except Exception as e:
                     failed.append(f"{label}: {e}")
-                    await self.notify(f"❌ <code>{html.escape(label)}</code>: {html.escape(str(e))}")
+                    if not quiet:
+                        await self.notify(f"❌ <code>{html.escape(label)}</code>: {html.escape(str(e))}")
                     continue
-                if me.username:
+                if me.username:  # pehle se hai — skip, koi gap nahi
                     had.append(label)
-                    await self.notify(f"✅ <code>{html.escape(label)}</code>: pehle se hai "
-                                      f"(@{html.escape(me.username)}), chhod diya.")
+                    if not quiet:
+                        await self.notify(f"✅ <code>{html.escape(label)}</code>: pehle se hai "
+                                          f"(@{html.escape(me.username)}), chhod diya.")
                     continue
+                if not first_set:  # gap sirf asli set-attempts ke beech
+                    await asyncio.sleep(random.uniform(20, 45))
+                first_set = False
                 try:
                     uname = await self._find_and_set_account_username(client)
                     made.append(f"{label}: @{uname}")
@@ -299,18 +326,22 @@ class Engine:
                 except errors.FloodWaitError as e:
                     failed.append(f"{label}: FloodWait {e.seconds}s")
                     await self.notify(f"⏳ <code>{html.escape(label)}</code>: FloodWait {e.seconds}s — skip. "
-                                      "Ye account abhi naya/limited hai, baad me dobara chala lena.")
+                                      "Ye account abhi naya/limited hai, baad me khud chal jayega.")
                 except Exception as e:
                     failed.append(f"{label}: {type(e).__name__}: {e}")
                     await self.notify(f"❌ <code>{html.escape(label)}</code>: {html.escape(str(e))}")
-            with_u = len(made) + len(had)
-            summary = (f"🏁 <b>Done.</b>\n"
-                       f"📛 Ab total <b>{with_u}/{len(accs)}</b> account pe username hai.\n\n"
-                       f"🆕 Naya laga: {len(made)}\n"
-                       f"✅ Pehle se tha: {len(had)}\n❌ Fail: {len(failed)}")
-            if failed:
-                summary += "\n\n<b>Fail hue:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in failed)
-            await self.notify(summary[:4000])
+            # quiet (startup) me kuch hua tabhi summary; manual me hamesha
+            if (not quiet) or made or failed:
+                with_u = len(made) + len(had)
+                summary = (f"🏁 <b>Username setup done.</b>\n"
+                           f"📛 Ab total <b>{with_u}/{len(accs)}</b> account pe username hai.\n\n"
+                           f"🆕 Naya laga: {len(made)}\n"
+                           f"✅ Pehle se tha: {len(had)}\n❌ Fail: {len(failed)}")
+                if failed:
+                    summary += "\n\n<b>Fail hue:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in failed)
+                await self.notify(summary[:4000])
+        except asyncio.CancelledError:
+            raise
         finally:
             self._ch_job = False
 

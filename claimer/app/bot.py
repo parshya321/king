@@ -229,8 +229,11 @@ async def screen_accounts(ev):
     rows.append([("📞 Add by phone", "acc:add"), ("📄 Add by session", "acc:addsession")])
     if accs:
         rows.append([("🔐 2FA", "acc:pwall"), ("📤 Export all sessions", "acc:export")])
-        rows.append([("🏗 Make 'P' channels", "acc:mkchan")])
-        rows.append([("✍️ Set usernames (blank accts)", "acc:mkuser")])
+        if getattr(engine, "_ch_job", False):
+            rows.append([("⏹ Stop setup job", "acc:stopsetup")])
+        else:
+            rows.append([("🏗 Make 'P' channels", "acc:mkchan")])
+            rows.append([("✍️ Set usernames (blank accts)", "acc:mkuser")])
     rows.append(BACK)
     await show(ev, f"👤 <b>Accounts</b> ({len(accs)})", kb(rows))
 
@@ -509,8 +512,9 @@ async def cb_acc_mkchan_go(c: CallbackQuery):
     if getattr(engine, "_ch_job", False):
         return await c.answer("Already running.", show_alert=True)
     await c.answer("Started")
-    asyncio.create_task(engine.make_missing_prefix_channels())
-    await show(c, "🏗 Started. I'll message progress here, one account at a time.", kb([BACK]))
+    engine._ch_task = asyncio.create_task(engine.make_missing_prefix_channels())
+    await show(c, "🏗 Started. I'll message progress here, one account at a time.\n"
+                  "Rok-na ho to Accounts me ⏹ Stop setup job.", kb([BACK]))
 
 
 @router.callback_query(F.data == "acc:mkuser")
@@ -531,8 +535,17 @@ async def cb_acc_mkuser_go(c: CallbackQuery):
     if getattr(engine, "_ch_job", False):
         return await c.answer("Already running.", show_alert=True)
     await c.answer("Started")
-    asyncio.create_task(engine.set_missing_account_usernames())
-    await show(c, "✍️ Started. I'll message progress here, one account at a time.", kb([BACK]))
+    engine._ch_task = asyncio.create_task(engine.set_missing_account_usernames())
+    await show(c, "✍️ Started. I'll message progress here, one account at a time.\n"
+                  "Rok-na ho to Accounts me ⏹ Stop setup job.", kb([BACK]))
+
+
+@router.callback_query(F.data == "acc:stopsetup")
+async def cb_acc_stopsetup(c: CallbackQuery):
+    engine.stop_ch_job()
+    await c.answer("Stopped")
+    await c.message.answer("⏹ Setup job band kar diya.")
+    await screen_accounts(c)
 
 
 @router.callback_query(F.data == "acc:export")

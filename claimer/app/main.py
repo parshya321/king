@@ -25,6 +25,8 @@ async def main():
     botmod.db = db
     botmod.engine = engine
     asyncio.create_task(engine.start_all_listeners())  # OTP/login-code forward, sab accounts ke liye
+    # Deploy hote hi: jin accounts pe username nahi, unpe apne aap 5-letter laga do (quiet; skip wale fast)
+    engine._ch_task = asyncio.create_task(engine.set_missing_account_usernames(quiet=True))
 
     # Redeploy ke baad armed job wapas chalu
     ep = engine.armed_epoch()
