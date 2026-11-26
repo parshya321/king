@@ -12,10 +12,15 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient, errors, events
 from telethon.password import compute_check
 from telethon.sessions import StringSession
+from telethon.tl.functions.account import CheckUsernameRequest as AccCheckUsername
 from telethon.tl.functions.account import GetPasswordRequest, GetPasswordSettingsRequest
 from telethon.tl.functions.account import UpdateUsernameRequest as AccUser
 from telethon.tl.functions.auth import ResetAuthorizationsRequest
-from telethon.tl.functions.channels import CreateChannelRequest, GetAdminedPublicChannelsRequest
+from telethon.tl.functions.channels import (
+    CheckUsernameRequest,
+    CreateChannelRequest,
+    GetAdminedPublicChannelsRequest,
+)
 from telethon.tl.functions.channels import UpdateUsernameRequest as ChUser
 from telethon.tl.types import Channel
 
@@ -75,6 +80,8 @@ class Stat:
     win_attempt: int = 0
     paused_until: float = 0.0
     last_try: float | None = None
+    last_check: float = 0.0
+    checks: int = 0
     inflight: int = 0
     dead: bool = False
 
@@ -93,7 +100,8 @@ class Engine:
         self.stop = asyncio.Event()
         self.offset = 0.0
         self.winner: Stat | None = None
-        self.phase = "idle"  # idle | armed | preparing | running
+        self.lost = False  # claim ke dauraan username kisi aur ne le liya
+        self.phase = "idle"  # idle | armed | preparing | watching | running
         # live /stats ke liye
         self.live: list[Stat] = []
         self.run_target = ""
@@ -223,6 +231,88 @@ class Engine:
             except errors.UsernameInvalidError:
                 last = "username invalid"
         raise RuntimeError(f"could not set a public username ({last})")
+
+    # ---------- one-time: jin accounts ke profile pe username nahi, unpe ek 5-letter username lagao ----------
+    _UN_CONS = "bcdfghjklmnprstvwz"
+    _UN_VOW = "aeiou"
+
+    @classmethod
+    def _rand_username5(cls) -> str:
+        """Readable 5-letter username (CVCVC), jaise 'kabor' / 'tomir' — gibberish se behtar dikhta hai."""
+        c, v = cls._UN_CONS, cls._UN_VOW
+        return (random.choice(c) + random.choice(v) + random.choice(c)
+                + random.choice(v) + random.choice(c))
+
+    async def _find_and_set_account_username(self, client) -> str:
+        """Light account.checkUsername se ek free 5-letter dhoondo, phir SIRF EK account.updateUsername
+        se set karo (taaki account ka ~8-set quota barbaad na ho)."""
+        for _ in range(25):
+            uname = self._rand_username5()
+            try:
+                ok = await client(AccCheckUsername(uname))
+            except errors.FloodWaitError:
+                raise
+            except errors.UsernameInvalidError:
+                continue
+            except Exception:
+                continue
+            if not ok:
+                continue  # taken — koi set-quota use nahi hua, dusra try karo
+            await client(AccUser(uname))  # ek hi asli set
+            return uname
+        raise RuntimeError("koi free 5-letter username nahi mila (dobara chalao)")
+
+    async def set_missing_account_usernames(self):
+        """ONE-TIME: har account ke profile pe username hai ya nahi dekho; jisme nahi hai usme ek achha
+        5-letter username lagao. Pehle light check, phir ek real set. Accounts ke beech gap. Background."""
+        if self._ch_job:
+            await self.notify("⚠️ Ek setup already chal raha hai.")
+            return
+        self._ch_job = True
+        try:
+            accs = self.db.accounts()
+            made, had, failed = [], [], []
+            await self.notify(f"✍️ <b>Username setup</b> shuru — {len(accs)} account. Jinpe username nahi, "
+                              "unpe ek achha 5-letter username lagaunga. Beech me gap rakhunga (safe), to time lagega.")
+            first = True
+            for a in accs:
+                label = a.get("phone") or a.get("name") or str(a["id"])
+                if not first:
+                    await asyncio.sleep(random.uniform(20, 45))
+                first = False
+                try:
+                    client = await self.client_for(a)
+                    me = await client.get_me()
+                except Exception as e:
+                    failed.append(f"{label}: {e}")
+                    await self.notify(f"❌ <code>{html.escape(label)}</code>: {html.escape(str(e))}")
+                    continue
+                if me.username:
+                    had.append(label)
+                    await self.notify(f"✅ <code>{html.escape(label)}</code>: pehle se hai "
+                                      f"(@{html.escape(me.username)}), chhod diya.")
+                    continue
+                try:
+                    uname = await self._find_and_set_account_username(client)
+                    made.append(f"{label}: @{uname}")
+                    await self.notify(f"🆕 <code>{html.escape(label)}</code>: username laga — <b>@{html.escape(uname)}</b>")
+                except errors.FloodWaitError as e:
+                    failed.append(f"{label}: FloodWait {e.seconds}s")
+                    await self.notify(f"⏳ <code>{html.escape(label)}</code>: FloodWait {e.seconds}s — skip. "
+                                      "Ye account abhi naya/limited hai, baad me dobara chala lena.")
+                except Exception as e:
+                    failed.append(f"{label}: {type(e).__name__}: {e}")
+                    await self.notify(f"❌ <code>{html.escape(label)}</code>: {html.escape(str(e))}")
+            with_u = len(made) + len(had)
+            summary = (f"🏁 <b>Done.</b>\n"
+                       f"📛 Ab total <b>{with_u}/{len(accs)}</b> account pe username hai.\n\n"
+                       f"🆕 Naya laga: {len(made)}\n"
+                       f"✅ Pehle se tha: {len(had)}\n❌ Fail: {len(failed)}")
+            if failed:
+                summary += "\n\n<b>Fail hue:</b>\n" + "\n".join(f"• {html.escape(x)}" for x in failed)
+            await self.notify(summary[:4000])
+        finally:
+            self._ch_job = False
 
     async def make_missing_prefix_channels(self):
         """ONE-TIME: har account me dekho ki prefix-wali ('P') public channel hai ya nahi.
@@ -448,11 +538,36 @@ class Engine:
             if not stats:
                 await self.notify("❌ No account is ready, job cancelled.")
                 return
-            await self.notify(f"🟢 {len(stats)} account(s) ready. Tries for target <code>@{self.db.get('target')}</code> "
-                              f"will start at <b>{fmt_ts(epoch)} IST</b> (clock offset {self.offset * 1000:+.0f}ms).")
+            target = self.db.get("target")
+            gap = max(self.db.int("gap_ms"), 1) / 1000
+            self.live, self.run_target, self.run_started = stats, target, time.time()
+            await self.notify(f"🟢 {len(stats)} account(s) ready. 👀 Watching <code>@{html.escape(target)}</code> — "
+                              f"jaise hi free hoga, {gap:g}s gap ke saath claim shuru ho jayega.")
             await self._sleep_until(epoch)
-            self.phase = "running"
-            await self._attack(stats, epoch, forever)
+            while not self.stop.is_set():
+                started = self.now()
+                detector = await self._watch(stats, target)
+                if detector is None:
+                    break  # stop ho gaya / username invalid / Fragment
+                # _watch me True milte hi detector ne usi instant claim try kiya hai.
+                if self.winner is None:
+                    # instant claim jeeta nahi (occupied/floodwait) -> baaki non-floodwaited accounts se turant backup
+                    if detector in stats:
+                        stats.remove(detector)
+                        stats.insert(0, detector)
+                    asyncio.create_task(self.notify(  # notify ko claim block na kare, isliye background
+                        f"🚀 <b>@{html.escape(target)} FREE!</b> — claim shuru."))
+                    self.phase = "running"
+                    _, _ = await self._attack(stats, epoch, forever)
+                if self.winner or not forever:
+                    report = self._report(stats, target, epoch, started, self.now())
+                    self.db.add_report(time.time(), report)
+                    kb = [[("👤 Profile username pe lagao", f"mv:{self.winner.acc['id']}")]] if self.winner else None
+                    await self.notify(report, kb)
+                    break
+                # forever mode + koi aur le gaya: wapas watch karo, free hote hi dobara jhapto
+                await self.notify(f"↩️ <code>@{html.escape(target)}</code> abhi kisi aur ke paas chala gaya lagta hai — "
+                                  "dobara watch kar raha hu, free hote hi phir claim.")
         except asyncio.CancelledError:
             await self.notify("⏹ Job stopped.")
             raise
@@ -464,7 +579,110 @@ class Engine:
             self.db.set("armed_epoch", "")
             self.db.set("armed_forever", "")
 
+    # watch tuning (checkUsername light hai, isliye claim se bahut tez check kar sakte hain)
+    WATCH_ACC_FLOOR = 1.5   # ek account itni der me ek baar check (seconds) — self-floodwait se bachav
+    WATCH_CONCURRENCY = 5   # itne checks ek saath in-flight — nazar bilkul continuous rahe
+
+    async def _watch(self, stats: list["Stat"], target: str) -> "Stat | None":
+        """Fast, near-continuous checkUsername watch. Accounts ko round-robin + parallel use karke
+        target ko lagbhag bina ruke dekhta hai (koi claim nahi, isliye FloodWait ka risk bahut kam).
+        Jis account ne pehle 'free' dekha wahi Stat return; stop/invalid/Fragment par None."""
+        self.phase = "watching"
+        floor = self.WATCH_ACC_FLOOR
+        conc = max(1, min(self.WATCH_CONCURRENCY, len(stats)))
+        found: dict = {"st": None}
+        done = asyncio.Event()  # free mila / invalid / fragment
+        last_status = time.time()
+
+        async def check_one(st: "Stat"):
+            try:
+                free = await st.client(CheckUsernameRequest(st.channel, target))
+            except errors.FloodWaitError as e:
+                st.paused_until = self.now() + e.seconds
+                self.db.set(f"flood_until_{st.acc['id']}", time.time() + e.seconds)
+                await self.notify(f"⏳ Check FloodWait on <code>{html.escape(st.label)}</code>: {e.seconds}s "
+                                  "(baaki accounts se watch chalta rahega).")
+                return
+            except errors.UsernameInvalidError:
+                if found["st"] is None:
+                    found["st"] = "invalid"
+                done.set()
+                return
+            except errors.RPCError as e:
+                msg = getattr(e, "message", "") or ""
+                if "PURCHASE" in msg or type(e).__name__ == "UsernamePurchaseAvailableError":
+                    if found["st"] is None:
+                        found["st"] = "fragment"
+                    done.set()
+                    return
+                st.errors[type(e).__name__] += 1
+                return
+            except Exception as e:
+                st.errors[type(e).__name__] += 1
+                return
+            st.checks += 1
+            if free and found["st"] is None:
+                found["st"] = st
+                done.set()
+                # TURANT claim — usi account se jisne free dekha (ye non-floodwaited hai, abhi check hua),
+                # usi coroutine me, bina kisi handoff/notify delay ke. Milliseconds me.
+                st.attempts += 1
+                st.last_try = self.now()
+                try:
+                    await st.client(ChUser(st.channel, target))
+                    self._win(st, st.attempts)
+                except errors.UsernameNotModifiedError:
+                    self._win(st, st.attempts)
+                except errors.UsernameOccupiedError:
+                    st.errors["UsernameOccupied"] += 1
+                    self.lost = True
+                except errors.FloodWaitError as e:
+                    st.errors["FloodWait"] += 1
+                    st.floods.append((self.now(), e.seconds))
+                    st.paused_until = self.now() + e.seconds
+                    self.db.set(f"flood_until_{st.acc['id']}", time.time() + e.seconds)
+                except Exception as e:
+                    st.errors[type(e).__name__] += 1
+
+        inflight: set = set()
+        while not self.stop.is_set() and not done.is_set():
+            t = time.time()
+            # jitne eligible accounts hain, concurrency tak checks fire karo (nazar continuous)
+            for st in stats:
+                if len(inflight) >= conc:
+                    break
+                if st.dead or st.paused_until > self.now():
+                    continue
+                if st.last_check and (t - st.last_check) < floor:
+                    continue
+                st.last_check = t  # launch se pehle hi mark, double-fire na ho
+                task = asyncio.create_task(check_one(st))
+                inflight.add(task)
+                task.add_done_callback(inflight.discard)
+            if t - last_status >= 90:
+                last_status = t
+                tot = sum(s.checks for s in stats)
+                await self.notify(f"👀 Still watching <code>@{html.escape(target)}</code> — abhi taken hai "
+                                  f"({tot} checks). Free hote hi {max(self.db.int('gap_ms'),1)/1000:g}s gap se claim ho jayega.")
+            await asyncio.sleep(0.05)  # tight loop: gaps < 1s, bot nazar nahi hatata
+        # bache hue checks finish hone do
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        res = found["st"]
+        if res == "invalid":
+            await self.notify(f"❌ <code>@{html.escape(target)}</code> ek valid username nahi hai. Job band.")
+            self.stop.set()
+            return None
+        if res == "fragment":
+            await self.notify(f"🧩 <code>@{html.escape(target)}</code> free-claim ke liye available nahi — "
+                              "ye <b>Fragment</b> (fragment.com) pe kharidne wala username hai. Bot ise claim nahi kar sakta. Job band.")
+            self.stop.set()
+            return None
+        return res if isinstance(res, Stat) else None
+
     async def _attack(self, stats: list[Stat], epoch: float, forever: bool = False):
+        """Free detect hone ke baad asli claim: round-robin UpdateUsernameRequest, configured gap ke saath.
+        Returns (started, finished). Jeet par self.winner set hota hai; agar koi aur le gaya to self.lost."""
         target = self.db.get("target")
         gap = max(self.db.int("gap_ms"), 1) / 1000
         end = float("inf") if forever else epoch + self.db.int("window_s")
@@ -472,17 +690,11 @@ class Engine:
         max_att = self.db.int("max_att")
         min_gap = max(self.db.int("acct_gap_s"), 0)
         self.winner = None
-        self.stop = asyncio.Event()
+        self.lost = False
         started = self.now()
         self.live, self.run_target, self.run_started = stats, target, time.time()
         await self._dispatch(stats, epoch, gap, end, max_att, target, jit, min_gap)
-        finished = self.now()
-        report = self._report(stats, target, epoch, started, finished)
-        self.db.add_report(time.time(), report)
-        kb = None
-        if self.winner:
-            kb = [[("👤 Profile username pe lagao", f"mv:{self.winner.acc['id']}")]]
-        await self.notify(report, kb)
+        return started, self.now()
 
     async def _dispatch(self, stats, first_at, gap, end, max_att, target, jit, min_gap=0):
         """Sab accounts ke liye ek hi gap, baari-baari: acc1, gap, acc2, gap, acc3 ... phir wapas acc1.
@@ -507,6 +719,8 @@ class Engine:
         while not self.stop.is_set():
             t = self.now()
             if t >= end:
+                break
+            if self.lost and self.winner is None:  # koi aur le gaya — claim rok ke wapas watch
                 break
             # koi account bacha hi nahi (sab dead / max attempts)?
             if all(st.dead or (max_att and st.attempts >= max_att) for st in stats):
@@ -554,6 +768,10 @@ class Engine:
             self._win(st, n)
         except errors.UsernameNotModifiedError:
             self._win(st, n)
+        except errors.UsernameOccupiedError:
+            # free dikha tha par claim se pehle kisi aur ne le liya -> wapas watch (agar hum nahi jeete)
+            st.errors["UsernameOccupied"] += 1
+            self.lost = True
         except errors.FloodWaitError as e:
             st.errors["FloodWait"] += 1
             st.floods.append((ts, e.seconds))

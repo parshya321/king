@@ -135,7 +135,7 @@ def _dur(sec: float) -> str:
 
 def stats_text() -> str:
     live = engine.live
-    running = engine.busy and engine.phase in ("running", "preparing")
+    running = engine.busy and engine.phase in ("running", "preparing", "watching")
     L = ["📊 <b>Stats</b>"]
     if not live:
         L.append("No job has run yet. Start one with <code>/set @username</code>.")
@@ -143,7 +143,8 @@ def stats_text() -> str:
         return "\n".join(L)
     total = sum(s.attempts for s in live)
     el = time.time() - engine.run_started if engine.run_started else 0
-    state = {"running": "🟢 Running", "preparing": "🟡 Preparing", "armed": "🟡 Armed"}.get(engine.phase, "⚪ Stopped")
+    state = {"running": "🟢 Claiming", "watching": "👀 Watching", "preparing": "🟡 Preparing",
+             "armed": "🟡 Armed"}.get(engine.phase, "⚪ Stopped")
     if engine.winner:
         state = "🏆 Username claimed!"
     L.append(f"{state}\n🎯 Username: <code>@{html.escape(engine.run_target or '—')}</code>")
@@ -229,6 +230,7 @@ async def screen_accounts(ev):
     if accs:
         rows.append([("🔐 2FA", "acc:pwall"), ("📤 Export all sessions", "acc:export")])
         rows.append([("🏗 Make 'P' channels", "acc:mkchan")])
+        rows.append([("✍️ Set usernames (blank accts)", "acc:mkuser")])
     rows.append(BACK)
     await show(ev, f"👤 <b>Accounts</b> ({len(accs)})", kb(rows))
 
@@ -509,6 +511,28 @@ async def cb_acc_mkchan_go(c: CallbackQuery):
     await c.answer("Started")
     asyncio.create_task(engine.make_missing_prefix_channels())
     await show(c, "🏗 Started. I'll message progress here, one account at a time.", kb([BACK]))
+
+
+@router.callback_query(F.data == "acc:mkuser")
+async def cb_acc_mkuser(c: CallbackQuery):
+    accs = db.accounts()
+    if not accs:
+        return await c.answer("No accounts yet.", show_alert=True)
+    if getattr(engine, "_ch_job", False):
+        return await c.answer("Already running.", show_alert=True)
+    await show(c, f"✍️ Set a nice 5-letter username on each of the {len(accs)} account(s) that has none? "
+                  "Accounts that already have a username are skipped. It first checks availability (light) and "
+                  "sets only one real username per account — runs slowly with a gap between accounts. One-time.",
+               kb([[("✅ Yes, start", "acc:mkuser:go")], [("❌ No", "acc:list")]]))
+
+
+@router.callback_query(F.data == "acc:mkuser:go")
+async def cb_acc_mkuser_go(c: CallbackQuery):
+    if getattr(engine, "_ch_job", False):
+        return await c.answer("Already running.", show_alert=True)
+    await c.answer("Started")
+    asyncio.create_task(engine.set_missing_account_usernames())
+    await show(c, "✍️ Started. I'll message progress here, one account at a time.", kb([BACK]))
 
 
 @router.callback_query(F.data == "acc:export")
@@ -911,9 +935,11 @@ async def do_start(ev):
     if engine.busy:
         return await show(ev, "⚠️ A job is already running. Stop it first.", kb([BACK]))
     engine.arm(time.time(), forever=True)
-    await show(ev, f"🟢 <b>Running</b>\nTarget: <code>@{db.get('target')}</code>\n"
+    await show(ev, f"👀 <b>Watching</b> <code>@{db.get('target')}</code>\n"
                    f"Gap: {gap_s()}s (+/- {db.get('jitter_pct')}% random)\n"
-                   "Tries will continue until the username is claimed or /stop.",
+                   "Bot lightly checks if the username is free. The moment it's free, it claims "
+                   "with that gap — until it's won or you /stop. If someone else grabs it first, "
+                   "it goes back to watching.",
                kb([[("⏹ Stop", "job:stop")], BACK]))
 
 
