@@ -43,7 +43,7 @@ def dec(s: str) -> str:
 DEFAULTS = {
     "target": "",      # username jo chahiye (bina @)
     "sched": "",       # "HH:MM:SS[.mmm]" ya "DD-MM-YYYY HH:MM:SS[.mmm]" (IST)
-    "gap_ms": "500",   # har account ke 2 tries ke beech ka gap
+    "gap_ms": "5000",  # 2 claims ke beech (global, round-robin) gap — default 5s (safe, IP spam na ho)
     "window_s": "120", # schedule time ke baad kitni der try karna hai
     "max_att": "0",    # per account max attempts (0 = unlimited)
     "lead_s": "15",    # schedule se kitna pehle accounts ready karne hain

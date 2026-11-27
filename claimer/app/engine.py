@@ -100,7 +100,6 @@ class Engine:
         self.stop = asyncio.Event()
         self.offset = 0.0
         self.winner: Stat | None = None
-        self.lost = False  # claim ke dauraan username kisi aur ne le liya
         self.phase = "idle"  # idle | armed | preparing | watching | running
         # live /stats ke liye
         self.live: list[Stat] = []
@@ -575,30 +574,23 @@ class Engine:
             await self.notify(f"🟢 {len(stats)} account(s) ready. 👀 Watching <code>@{html.escape(target)}</code> — "
                               f"jaise hi free hoga, {gap:g}s gap ke saath claim shuru ho jayega.")
             await self._sleep_until(epoch)
-            while not self.stop.is_set():
-                started = self.now()
-                detector = await self._watch(stats, target)
-                if detector is None:
-                    break  # stop ho gaya / username invalid / Fragment
-                # _watch me True milte hi detector ne usi instant claim try kiya hai.
-                if self.winner is None:
-                    # instant claim jeeta nahi (occupied/floodwait) -> baaki non-floodwaited accounts se turant backup
-                    if detector in stats:
-                        stats.remove(detector)
-                        stats.insert(0, detector)
-                    asyncio.create_task(self.notify(  # notify ko claim block na kare, isliye background
-                        f"🚀 <b>@{html.escape(target)} FREE!</b> — claim shuru."))
-                    self.phase = "running"
-                    _, _ = await self._attack(stats, epoch, forever)
-                if self.winner or not forever:
-                    report = self._report(stats, target, epoch, started, self.now())
-                    self.db.add_report(time.time(), report)
-                    kb = [[("👤 Profile username pe lagao", f"mv:{self.winner.acc['id']}")]] if self.winner else None
-                    await self.notify(report, kb)
-                    break
-                # forever mode + koi aur le gaya: wapas watch karo, free hote hi dobara jhapto
-                await self.notify(f"↩️ <code>@{html.escape(target)}</code> abhi kisi aur ke paas chala gaya lagta hai — "
-                                  "dobara watch kar raha hu, free hote hi phir claim.")
+            # 1) Watch: jab tak checkUsername "free" na dikhaye
+            started = self.now()
+            detector = await self._watch(stats, target)
+            if detector is None:
+                return  # stop / username invalid / Fragment (watch ne message de diya)
+            # 2) Free dikha -> watch band, ab har ~gap second me ek account se claim (round-robin) jab tak
+            #    mil na jaye ya /stop. checkUsername ab nahi karte (free dikh chuka, bas claim karte hain).
+            gap = max(self.db.int("gap_ms"), 1) / 1000
+            await self.notify(f"🚀 <b>@{html.escape(target)} free dikha!</b> (<code>{html.escape(detector.label)}</code>) — "
+                              f"watch band. Ab har ~{gap:g}s me ek account se claim try karunga (baari-baari), "
+                              "jab tak mil na jaye ya /stop.")
+            self.phase = "running"
+            started, finished = await self._attack(stats, epoch, forever)
+            report = self._report(stats, target, epoch, started, finished)
+            self.db.add_report(time.time(), report)
+            kb = [[("👤 Profile username pe lagao", f"mv:{self.winner.acc['id']}")]] if self.winner else None
+            await self.notify(report, kb)
         except asyncio.CancelledError:
             await self.notify("⏹ Job stopped.")
             raise
@@ -671,25 +663,7 @@ class Engine:
             else:
                 st.checks += 1
                 if free:
-                    # TURANT inline claim usi account se (non-floodwaited, abhi check hua) — milliseconds
-                    st.attempts += 1
-                    st.last_try = self.now()
-                    try:
-                        await st.client(ChUser(st.channel, target))
-                        self._win(st, st.attempts)
-                    except errors.UsernameNotModifiedError:
-                        self._win(st, st.attempts)
-                    except errors.UsernameOccupiedError:
-                        st.errors["UsernameOccupied"] += 1
-                        self.lost = True
-                    except errors.FloodWaitError as e:
-                        st.errors["FloodWait"] += 1
-                        st.floods.append((self.now(), e.seconds))
-                        st.paused_until = self.now() + e.seconds
-                        self.db.set(f"flood_until_{st.acc['id']}", time.time() + e.seconds)
-                    except Exception as e:
-                        st.errors[type(e).__name__] += 1
-                    return st
+                    return st  # free dikha — watch band, ab _run claim phase me jayega (koi claim yahan nahi)
             if time.time() - last_status >= 90:
                 last_status = time.time()
                 tot = sum(s.checks for s in stats)
@@ -711,7 +685,7 @@ class Engine:
 
     async def _attack(self, stats: list[Stat], epoch: float, forever: bool = False):
         """Free detect hone ke baad asli claim: round-robin UpdateUsernameRequest, configured gap ke saath.
-        Returns (started, finished). Jeet par self.winner set hota hai; agar koi aur le gaya to self.lost."""
+        Returns (started, finished). Jeet par self.winner set hota hai."""
         target = self.db.get("target")
         gap = max(self.db.int("gap_ms"), 1) / 1000
         end = float("inf") if forever else epoch + self.db.int("window_s")
@@ -719,7 +693,6 @@ class Engine:
         max_att = self.db.int("max_att")
         min_gap = max(self.db.int("acct_gap_s"), 0)
         self.winner = None
-        self.lost = False
         started = self.now()
         self.live, self.run_target, self.run_started = stats, target, time.time()
         await self._dispatch(stats, epoch, gap, end, max_att, target, jit, min_gap)
@@ -748,8 +721,6 @@ class Engine:
         while not self.stop.is_set():
             t = self.now()
             if t >= end:
-                break
-            if self.lost and self.winner is None:  # koi aur le gaya — claim rok ke wapas watch
                 break
             # koi account bacha hi nahi (sab dead / max attempts)?
             if all(st.dead or (max_att and st.attempts >= max_att) for st in stats):
@@ -798,9 +769,8 @@ class Engine:
         except errors.UsernameNotModifiedError:
             self._win(st, n)
         except errors.UsernameOccupiedError:
-            # free dikha tha par claim se pehle kisi aur ne le liya -> wapas watch (agar hum nahi jeete)
+            # abhi occupied/cooldown — koi baat nahi, paced round-robin se try chalta rahega
             st.errors["UsernameOccupied"] += 1
-            self.lost = True
         except errors.FloodWaitError as e:
             st.errors["FloodWait"] += 1
             st.floods.append((ts, e.seconds))
