@@ -617,7 +617,6 @@ class Engine:
         aur return hota hai; stop/invalid/Fragment par None. 25-message spam nahi: sab floodwaited ho
         to ek hi throttled message."""
         self.phase = "watching"
-        step = max(self.db.int("watch_step_s"), 1)  # 2 checks ke beech (total) seconds
         n = len(stats)
         idx = 0
         last_status = time.time()
@@ -696,6 +695,7 @@ class Engine:
                 tot = sum(s.checks for s in stats)
                 await self.notify(f"👀 Still watching <code>@{html.escape(target)}</code> — abhi taken hai "
                                   f"({tot} checks). Free hote hi {max(self.db.int('gap_ms'),1)/1000:g}s gap se claim.")
+            step = max(self.db.int("watch_step_s"), 1)  # har check se pehle padho -> pace live badal sake
             await asyncio.sleep(step)  # IP-gentle pace
 
         if verdict == "invalid":
