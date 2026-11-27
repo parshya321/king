@@ -610,106 +610,104 @@ class Engine:
             self.db.set("armed_epoch", "")
             self.db.set("armed_forever", "")
 
-    # watch tuning (checkUsername light hai, isliye claim se bahut tez check kar sakte hain)
-    WATCH_ACC_FLOOR = 1.5   # ek account itni der me ek baar check (seconds) — self-floodwait se bachav
-    WATCH_CONCURRENCY = 5   # itne checks ek saath in-flight — nazar bilkul continuous rahe
-
     async def _watch(self, stats: list["Stat"], target: str) -> "Stat | None":
-        """Fast, near-continuous checkUsername watch. Accounts ko round-robin + parallel use karke
-        target ko lagbhag bina ruke dekhta hai (koi claim nahi, isliye FloodWait ka risk bahut kam).
-        Jis account ne pehle 'free' dekha wahi Stat return; stop/invalid/Fragment par None."""
+        """IP-gentle checkUsername watch. Ek-ek account se (sequential) round-robin check, har check ke
+        beech `watch_step_s` ka pace — taaki ek hi IP se check-rate kam rahe aur checkUsername khud
+        FloodWait na khaye. Jisne pehle 'free' dekha, wahi account usi instant inline claim karta hai
+        aur return hota hai; stop/invalid/Fragment par None. 25-message spam nahi: sab floodwaited ho
+        to ek hi throttled message."""
         self.phase = "watching"
-        floor = self.WATCH_ACC_FLOOR
-        conc = max(1, min(self.WATCH_CONCURRENCY, len(stats)))
-        found: dict = {"st": None}
-        done = asyncio.Event()  # free mila / invalid / fragment
+        step = max(self.db.int("watch_step_s"), 1)  # 2 checks ke beech (total) seconds
+        n = len(stats)
+        idx = 0
         last_status = time.time()
+        last_flood_note = 0.0
+        verdict = None  # None | "invalid" | "fragment" | Stat
 
-        async def check_one(st: "Stat"):
+        while not self.stop.is_set() and verdict is None:
+            # agla eligible account (not dead, not floodwaited)
+            pick = None
+            for k in range(n):
+                st = stats[(idx + k) % n]
+                if st.dead or st.paused_until > self.now():
+                    continue
+                pick = (idx + k) % n
+                break
+            if pick is None:  # sab floodwaited/dead
+                live = [s for s in stats if not s.dead]
+                if not live:
+                    await self.notify("❌ Sab accounts dead/logout ho gaye. Job band.")
+                    self.stop.set()
+                    return None
+                nxt = min(s.paused_until for s in live)
+                waitfor = max(nxt - self.now(), 0.5)
+                if time.time() - last_flood_note >= 60:  # ek hi throttled message, 25 nahi
+                    last_flood_note = time.time()
+                    await self.notify(f"⏳ Sab accounts abhi check rate-limit (FloodWait) pe — ~{int(waitfor)}s "
+                                      "wait, phir watch apne aap resume ho jayega.")
+                await asyncio.sleep(min(waitfor, 5))
+                continue
+
+            st = stats[pick]
+            idx = (pick + 1) % n
+            st.last_check = time.time()
             try:
                 free = await st.client(CheckUsernameRequest(st.channel, target))
             except errors.FloodWaitError as e:
                 st.paused_until = self.now() + e.seconds
                 self.db.set(f"flood_until_{st.acc['id']}", time.time() + e.seconds)
-                await self.notify(f"⏳ Check FloodWait on <code>{html.escape(st.label)}</code>: {e.seconds}s "
-                                  "(baaki accounts se watch chalta rahega).")
-                return
+                # per-account note nahi (spam); upar wala "sab floodwaited" message kaafi hai
+                continue
             except errors.UsernameInvalidError:
-                if found["st"] is None:
-                    found["st"] = "invalid"
-                done.set()
-                return
+                verdict = "invalid"
+                break
             except errors.RPCError as e:
                 msg = getattr(e, "message", "") or ""
                 if "PURCHASE" in msg or type(e).__name__ == "UsernamePurchaseAvailableError":
-                    if found["st"] is None:
-                        found["st"] = "fragment"
-                    done.set()
-                    return
+                    verdict = "fragment"
+                    break
                 st.errors[type(e).__name__] += 1
-                return
             except Exception as e:
                 st.errors[type(e).__name__] += 1
-                return
-            st.checks += 1
-            if free and found["st"] is None:
-                found["st"] = st
-                done.set()
-                # TURANT claim — usi account se jisne free dekha (ye non-floodwaited hai, abhi check hua),
-                # usi coroutine me, bina kisi handoff/notify delay ke. Milliseconds me.
-                st.attempts += 1
-                st.last_try = self.now()
-                try:
-                    await st.client(ChUser(st.channel, target))
-                    self._win(st, st.attempts)
-                except errors.UsernameNotModifiedError:
-                    self._win(st, st.attempts)
-                except errors.UsernameOccupiedError:
-                    st.errors["UsernameOccupied"] += 1
-                    self.lost = True
-                except errors.FloodWaitError as e:
-                    st.errors["FloodWait"] += 1
-                    st.floods.append((self.now(), e.seconds))
-                    st.paused_until = self.now() + e.seconds
-                    self.db.set(f"flood_until_{st.acc['id']}", time.time() + e.seconds)
-                except Exception as e:
-                    st.errors[type(e).__name__] += 1
-
-        inflight: set = set()
-        while not self.stop.is_set() and not done.is_set():
-            t = time.time()
-            # jitne eligible accounts hain, concurrency tak checks fire karo (nazar continuous)
-            for st in stats:
-                if len(inflight) >= conc:
-                    break
-                if st.dead or st.paused_until > self.now():
-                    continue
-                if st.last_check and (t - st.last_check) < floor:
-                    continue
-                st.last_check = t  # launch se pehle hi mark, double-fire na ho
-                task = asyncio.create_task(check_one(st))
-                inflight.add(task)
-                task.add_done_callback(inflight.discard)
-            if t - last_status >= 90:
-                last_status = t
+            else:
+                st.checks += 1
+                if free:
+                    # TURANT inline claim usi account se (non-floodwaited, abhi check hua) — milliseconds
+                    st.attempts += 1
+                    st.last_try = self.now()
+                    try:
+                        await st.client(ChUser(st.channel, target))
+                        self._win(st, st.attempts)
+                    except errors.UsernameNotModifiedError:
+                        self._win(st, st.attempts)
+                    except errors.UsernameOccupiedError:
+                        st.errors["UsernameOccupied"] += 1
+                        self.lost = True
+                    except errors.FloodWaitError as e:
+                        st.errors["FloodWait"] += 1
+                        st.floods.append((self.now(), e.seconds))
+                        st.paused_until = self.now() + e.seconds
+                        self.db.set(f"flood_until_{st.acc['id']}", time.time() + e.seconds)
+                    except Exception as e:
+                        st.errors[type(e).__name__] += 1
+                    return st
+            if time.time() - last_status >= 90:
+                last_status = time.time()
                 tot = sum(s.checks for s in stats)
                 await self.notify(f"👀 Still watching <code>@{html.escape(target)}</code> — abhi taken hai "
-                                  f"({tot} checks). Free hote hi {max(self.db.int('gap_ms'),1)/1000:g}s gap se claim ho jayega.")
-            await asyncio.sleep(0.05)  # tight loop: gaps < 1s, bot nazar nahi hatata
-        # bache hue checks finish hone do
-        if inflight:
-            await asyncio.gather(*inflight, return_exceptions=True)
-        res = found["st"]
-        if res == "invalid":
+                                  f"({tot} checks). Free hote hi {max(self.db.int('gap_ms'),1)/1000:g}s gap se claim.")
+            await asyncio.sleep(step)  # IP-gentle pace
+
+        if verdict == "invalid":
             await self.notify(f"❌ <code>@{html.escape(target)}</code> ek valid username nahi hai. Job band.")
             self.stop.set()
             return None
-        if res == "fragment":
+        if verdict == "fragment":
             await self.notify(f"🧩 <code>@{html.escape(target)}</code> free-claim ke liye available nahi — "
                               "ye <b>Fragment</b> (fragment.com) pe kharidne wala username hai. Bot ise claim nahi kar sakta. Job band.")
             self.stop.set()
             return None
-        return res if isinstance(res, Stat) else None
+        return None
 
     async def _attack(self, stats: list[Stat], epoch: float, forever: bool = False):
         """Free detect hone ke baad asli claim: round-robin UpdateUsernameRequest, configured gap ke saath.

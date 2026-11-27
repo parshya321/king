@@ -203,6 +203,7 @@ def settings_view(adv=False):
         f"⏳ Min gap per account: <b>{g('acct_gap_s')} s</b> (compulsory, that account won't retry before this)\n"
         f"🎲 Random: <b>+/- {g('jitter_pct')}%</b> (jitters the gap up/down, 0 = fixed)\n"
         f"🔢 Max attempts/account: <b>{g('max_att')}</b> (0 = unlimited)\n"
+        f"👀 Watch pace: <b>{g('watch_step_s')} s</b> between checks (badhao agar check FloodWait aaye)\n"
         f"🔔 FloodWait notify: <b>{'ON' if g('notify') == '1' else 'OFF'}</b>"
     )
     rows = [
@@ -210,6 +211,7 @@ def settings_view(adv=False):
         [("➖0.1s", "adj:gap_ms:-100"), ("⏱ Gap ✏️", "edit:gap_ms"), ("➕0.1s", "adj:gap_ms:100")],
         [("➖5", "adj:acct_gap_s:-5"), ("⏳ Account gap ✏️", "edit:acct_gap_s"), ("➕5", "adj:acct_gap_s:5")],
         [("➖5", "adj:jitter_pct:-5"), ("🎲 Random % ✏️", "edit:jitter_pct"), ("➕5", "adj:jitter_pct:5")],
+        [("➖1", "adj:watch_step_s:-1"), ("👀 Watch pace ✏️", "edit:watch_step_s"), ("➕1", "adj:watch_step_s:1")],
         [("➖10", "adj:max_att:-10"), ("🔢 Max ✏️", "edit:max_att"), ("➕10", "adj:max_att:10")],
         [(f"🔔 Notify: {'ON' if g('notify') == '1' else 'OFF'}", "tog:notify")],
         [("⬅️ Simple settings", "set:menu")],
@@ -379,7 +381,7 @@ async def cb_settings_adv(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("adj:"))
 async def cb_adj(c: CallbackQuery):
     _, key, delta = c.data.split(":")[:3]
-    floor = {"gap_ms": 1, "max_att": 0, "jitter_pct": 0, "acct_gap_s": 0}[key]
+    floor = {"gap_ms": 1, "max_att": 0, "jitter_pct": 0, "acct_gap_s": 0, "watch_step_s": 1}[key]
     val = max(floor, db.int(key) + int(delta))
     db.set(key, min(val, 50) if key == "jitter_pct" else val)
     await screen_settings(c, key != "gap_ms")
@@ -399,6 +401,7 @@ PROMPTS = {
     "max_att": "🔢 Send max attempts per account (0 = unlimited):",
     "acct_gap_s": "⏳ Minimum <b>seconds</b> between 2 tries of the same account (e.g. 10):",
     "jitter_pct": "🎲 Send random % (0-50). E.g. 20 = a 10s gap becomes 8-12s:",
+    "watch_step_s": "👀 Watch pace: seconds between checkUsername calls (e.g. 2-5). Higher = gentler on one IP:",
 }
 
 
@@ -434,7 +437,7 @@ async def on_edit(m: Message, state: FSMContext):
             return await m.answer("❌ Send a valid number:")
     db.set(key, v)
     await state.clear()
-    await screen_settings(m, key in ("max_att", "jitter_pct", "acct_gap_s"))
+    await screen_settings(m, key in ("max_att", "jitter_pct", "acct_gap_s", "watch_step_s"))
 
 
 # ----- accounts -----

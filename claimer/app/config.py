@@ -52,4 +52,5 @@ DEFAULTS = {
     "channel_prefix": "p",  # bot sirf aisi public channel use karega jiska username isse shuru ho (khaali = koi bhi public/auto banao)
     "jitter_pct": "20", # gap me +/- itna % random (10s gap -> 8-12s). 0 = bilkul fixed
     "armed_forever": "",
+    "watch_step_s": "2",  # watch me 2 checkUsername ke beech (total) itne second — IP-gentle (badhao agar FloodWait aaye)
 }
