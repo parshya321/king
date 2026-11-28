@@ -447,7 +447,7 @@ class Engine:
     async def ensure_channel(self, acc: dict, client: TelegramClient) -> tuple[Channel, str]:
         """Claim ke liye channel chunna.
         channel_prefix set ho (default 'p'): account ki apni public channel jiska username us letter se shuru ho.
-        Nayi channel BANAI NAHI JATI (channel banana + username lagana naye accounts par FloodWait deta hai)."""
+        Agar aisi channel na mile to bot APNE AAP ek nayi 'P' channel bana deta hai."""
         prefix = (self.db.get("channel_prefix") or "").strip().lower().lstrip("@")
         if prefix:
             pub = []
@@ -467,9 +467,25 @@ class Engine:
                 for e in dialogs:
                     if e.id == acc["channel_id"] and e.broadcast and e.creator:
                         return await self._make_public(client, e), "saved channel"
-            raise RuntimeError(f"No public channel starting with '{prefix.upper()}' was found on this account. "
-                               f"Create a public channel in the Telegram app with a username starting with "
-                               f"'{prefix.upper()}', then add the account again (or reactivate it from /menu).")
+            # koi 'P' channel nahi mili -> bot khud ek bana de (prefix-wala username ke saath)
+            res = await client(CreateChannelRequest(title=random.choice(self.NEUTRAL_TITLES), about="", broadcast=True))
+            ch = res.chats[0]
+            last = "unknown"
+            for _ in range(5):
+                uname = prefix + secrets.token_hex(4)  # p + 8 hex = valid username
+                try:
+                    await client(ChUser(ch, uname))
+                    self.db.update_account(acc["id"], channel_id=ch.id)
+                    try:
+                        ch = await client.get_entity(ch)
+                    except Exception:
+                        ch.username = uname
+                    return ch, f"auto-created a '{prefix.upper()}' channel (@{uname})"
+                except errors.UsernameOccupiedError:
+                    last = "username occupied"
+                except errors.UsernameInvalidError:
+                    last = "username invalid"
+            raise RuntimeError(f"auto-create: channel ban gayi par '{prefix.upper()}' username set nahi hua ({last})")
         dialogs = [d.entity async for d in client.iter_dialogs(limit=300) if isinstance(d.entity, Channel)]
         owned = [e for e in dialogs if e.broadcast and e.creator]
         if acc.get("channel_id"):
